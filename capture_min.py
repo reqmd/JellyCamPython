@@ -10,6 +10,10 @@ import cv2
 SDK_DIR = r"C:\Program Files\MVTec\bin\x64-win64"
 IDX = 0        # индекс камеры
 LINES = 1024   # сколько считываний сенсора склеить в один кадр
+EXPOSURE_MS = 0.8    # выдержка одной строки, мс (диапазон 0.0021..0.8)
+TRIGGER_MODE = 0    
+
+#FIXED_RATE = 100.0
 
 os.add_dll_directory(SDK_DIR)
 ksj = WinDLL(os.path.join(SDK_DIR, "KSJApi64.dll"))
@@ -19,10 +23,10 @@ ksj.KSJ_CaptureSetFieldOfViewEx.argtypes = (c_int,) * 7 + (c_ushort,)
 ksj.KSJ_Init()
 
 # 1. Режим съёмки: 0 = внутренний, камера снимает непрерывно сама.
-ksj.KSJ_TriggerModeSet(IDX, 0)
+ksj.KSJ_TriggerModeSet(IDX, TRIGGER_MODE)
 
 # 2. Выдержка одной строки, мс.
-ksj.KSJ_ExposureTimeSet(IDX, 0.5)
+ksj.KSJ_ExposureTimeSet(IDX, EXPOSURE_MS)
 
 # 3. Склейка строк в площадное изображение: весь сенсор (2048x2) x LINES раз.
 ksj.KSJ_CaptureSetFieldOfViewEx(IDX, 0, 0, 2048, 2, 0, 0, LINES)
