@@ -7,3 +7,5 @@ stitch.png
 whitebalance.py
 try.py
 /linux/data
+/linux/models/
+/linux/__pycache__
