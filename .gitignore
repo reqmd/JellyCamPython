@@ -12,3 +12,5 @@ try.py
 /onnx
 /rknn
 models.yaml
+/objects
+ribbon.png

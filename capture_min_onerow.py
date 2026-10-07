@@ -20,8 +20,8 @@ SDK_DIR = r"C:\Program Files (x86)\CatchBEST\IndustryCamera\Applications\KSJShow
 IDX = 0
 
 LINES = 256            # размер транспортной порции, не логики
-EXPOSURE_MS = 0.5
-FIXED_RATE = 134.0
+EXPOSURE_MS = 0.25
+FIXED_RATE = 1250.0
 RIBBON_H = 1024        # только для показа
 
 # ------------------------------------------------------------ настройка камеры
