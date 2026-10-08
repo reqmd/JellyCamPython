@@ -1,50 +1,30 @@
 """
-Общая часть модифицированного протокола Modbus поверх UDP.
+Сервер DSP-протокола (модифицированный Modbus поверх UDP).
 
-Формат запроса на чтение (13 байт):
-    [0]      адрес устройства
-    [1]      резерв (0)
-    [2]      код функции (3)
-    [3..6]   адрес начального регистра, uint32 big-endian
-    [7..10]  число регистров,           uint32 big-endian
-    [11..12] CRC16
+Принимает запрос на чтение, отвечает значениями регистров.
+Все регистры равны 0, кроме 99-го — он равен 1.
 
-Формат ответа (count * 2 + 14 байт):
-    [0]      адрес устройства
-    [1]      0 - фрейм не последний, 1 - последний
-    [2]      код функции (3)
-    [3]      состояние DSP
-    [4..7]   адрес начального регистра фрагмента, uint32 big-endian
-    [8..11]  число регистров во фрагменте,        uint32 big-endian
-    [12..]   значения регистров, uint16 big-endian каждый
-    [n-2..]  CRC16
+Запуск:
+    python3 dsp_server.py 192.168.2.101 5001
 """
 
+import socket
 import struct
+import sys
 
+UNIT = 1          # адрес устройства
+DSP_STATE = 0     # байт состояния DSP
 FUNC_READ = 0x03
+FUNC_WRITE = 0x10
 
-REQ_LEN = 13        # длина запроса целиком
-RESP_HDR = 12       # заголовок ответа [0..11]
-CRC_LEN = 2
-
-MAX_REGS = 100_000  # защита от мусора в поле длины
-
-# UDP payload при MTU 1500 = 1472 байта; минус 14 служебных => 729 регистров.
-# Берём с запасом, чтобы не ловить IP-фрагментацию.
-MAX_REGS_PER_FRAME = 500
+# Значения регистров. Всё, чего нет в словаре, равно нулю.
+REGISTERS = {
+    99: 1,
+}
 
 
-class ProtocolError(Exception):
-    pass
-
-
-class CrcError(ProtocolError):
-    pass
-
-
-def crc16_modbus(data: bytes) -> int:
-    """CRC-16/MODBUS: полином 0xA001, инициализация 0xFFFF."""
+def crc16(data: bytes) -> int:
+    """CRC-16/MODBUS, в кадре идёт старшим байтом вперёд."""
     crc = 0xFFFF
     for b in data:
         crc ^= b
@@ -53,102 +33,73 @@ def crc16_modbus(data: bytes) -> int:
     return crc
 
 
-def pack_crc(value: int, big_endian: bool = True) -> bytes:
-    return struct.pack(">H" if big_endian else "<H", value)
+def with_crc(frame: bytes) -> bytes:
+    return frame + struct.pack(">H", crc16(frame))
 
 
-def append_crc(frame: bytes, big_endian: bool = True) -> bytes:
-    return frame + pack_crc(crc16_modbus(frame), big_endian)
+def crc_ok(frame: bytes) -> bool:
+    return frame[-2:] == struct.pack(">H", crc16(frame[:-2]))
 
 
-def verify_crc(frame: bytes, big_endian: bool = True) -> bool:
-    if len(frame) < CRC_LEN + 1:
-        return False
-    body, tail = frame[:-CRC_LEN], frame[-CRC_LEN:]
-    return tail == pack_crc(crc16_modbus(body), big_endian)
-
-
-# --------------------------------------------------------------------------
-# Запрос
-# --------------------------------------------------------------------------
-
-def build_request(unit: int, start: int, count: int,
-                  crc_big_endian: bool = True) -> bytes:
-    frame = bytes([unit & 0xFF, 0x00, FUNC_READ]) + struct.pack(">II", start, count)
-    return append_crc(frame, crc_big_endian)
-
-
-def parse_request(dgram: bytes, crc_big_endian: bool = True,
-                  check_crc: bool = True) -> dict:
-    if len(dgram) != REQ_LEN:
-        raise ProtocolError(
-            f"длина запроса {len(dgram)} вместо {REQ_LEN}: {dgram.hex(' ')}")
-
-    if check_crc and not verify_crc(dgram, crc_big_endian):
-        raise CrcError(f"CRC запроса не сошлась: {dgram.hex(' ')}")
-
-    unit, reserved, func = dgram[0], dgram[1], dgram[2]
-    start, count = struct.unpack(">II", dgram[3:11])
-
-    if func != FUNC_READ:
-        raise ProtocolError(f"код функции 0x{func:02X} не поддерживается")
-
-    return {"unit": unit, "reserved": reserved, "func": func,
-            "start": start, "count": count}
-
-
-# --------------------------------------------------------------------------
-# Ответ
-# --------------------------------------------------------------------------
-
-def build_response_frame(unit: int, last: bool, dsp: int,
-                         start: int, regs, crc_big_endian: bool = True) -> bytes:
-    """Один фрагмент ответа."""
-    count = len(regs)
-    frame = bytes([unit & 0xFF, 1 if last else 0, FUNC_READ, dsp & 0xFF])
+def build_read_response(start: int, count: int) -> bytes:
+    """
+    [0] адрес устройства   [1] 1 = последний фрейм   [2] 3   [3] состояние DSP
+    [4..7] адрес начального регистра   [8..11] число регистров
+    [12..] значения регистров   [n-2..] CRC
+    Длина = count * 2 + 14
+    """
+    values = [REGISTERS.get(start + i, 0) for i in range(count)]
+    frame = bytes([UNIT, 1, FUNC_READ, DSP_STATE])
     frame += struct.pack(">II", start, count)
-    frame += struct.pack(f">{count}H", *regs)
-    return append_crc(frame, crc_big_endian)
+    frame += struct.pack(f">{count}H", *values)
+    return with_crc(frame)
 
 
-def build_response_frames(unit: int, dsp: int, start: int, regs,
-                          max_per_frame: int = MAX_REGS_PER_FRAME,
-                          crc_big_endian: bool = True):
-    """Режет ответ на фрагменты, последнему ставит флаг last=1."""
-    frames = []
-    total = len(regs)
-    offset = 0
+def build_write_response(start: int, count: int) -> bytes:
+    """Подтверждение записи: та же шапка, без значений. 14 байт."""
+    frame = bytes([UNIT, 1, FUNC_WRITE, DSP_STATE])
+    frame += struct.pack(">II", start, count)
+    return with_crc(frame)
+
+
+def handle(data: bytes):
+    """Возвращает кадр ответа или None, если запрос надо проигнорировать."""
+    if len(data) < 13 or not crc_ok(data):
+        return None
+    if data[0] != UNIT:
+        return None
+
+    func = data[2]
+    start, count = struct.unpack(">II", data[3:11])
+
+    if func == FUNC_READ:
+        if count == 0 or count > 700:        # 700 регистров ещё влезают в MTU
+            return None
+        print(f"чтение: регистр {start}, количество {count}")
+        return build_read_response(start, count)
+
+    if func == FUNC_WRITE:
+        values = struct.unpack(f">{count}H", data[11:11 + count * 2])
+        print(f"запись: регистр {start} = {list(values)}")
+        return build_write_response(start, count)
+
+    return None
+
+
+def main():
+    host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5001
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    print(f"слушаю {host}:{port}, адрес устройства {UNIT}")
+
     while True:
-        chunk = regs[offset:offset + max_per_frame]
-        last = offset + len(chunk) >= total
-        frames.append(build_response_frame(
-            unit, last, dsp, start + offset, chunk, crc_big_endian))
-        offset += len(chunk)
-        if last:
-            return frames
+        data, addr = sock.recvfrom(65535)
+        response = handle(data)
+        if response:
+            sock.sendto(response, addr)
 
 
-def parse_response_frame(dgram: bytes, crc_big_endian: bool = True,
-                         check_crc: bool = True) -> dict:
-    if len(dgram) < RESP_HDR + CRC_LEN:
-        raise ProtocolError(f"слишком короткая датаграмма: {len(dgram)} байт")
-
-    unit, last, func, dsp = dgram[0], dgram[1], dgram[2], dgram[3]
-    start, count = struct.unpack(">II", dgram[4:RESP_HDR])
-
-    if func != FUNC_READ:
-        raise ProtocolError(f"код функции 0x{func:02X}: {dgram.hex(' ')}")
-    if count > MAX_REGS:
-        raise ProtocolError(f"абсурдное число регистров {count}")
-
-    expected = count * 2 + 14
-    if len(dgram) != expected:
-        raise ProtocolError(
-            f"длина {len(dgram)} != ожидаемой {expected} при count={count}")
-
-    if check_crc and not verify_crc(dgram, crc_big_endian):
-        raise CrcError(f"CRC ответа не сошлась: {dgram.hex(' ')}")
-
-    regs = list(struct.unpack(f">{count}H", dgram[RESP_HDR:-CRC_LEN]))
-    return {"unit": unit, "last": bool(last), "dsp": dsp,
-            "start": start, "count": count, "regs": regs}
+if __name__ == "__main__":
+    main()
