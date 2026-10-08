@@ -9,8 +9,9 @@ def convert_in_rknn():
         data = yaml.safe_load(file)
         ONNX_PATH = data['onnx']
         RKNN_PATH = data['rknn']
-    rknn.config(mean_values=[[123.675, 116.28, 103.53]],
-            std_values=[[58.395, 57.12, 57.375]],
+    rknn = RKNN(verbose = True)
+    rknn.config(mean_values=[[0, 0, 0]],
+            std_values=[[255, 255, 255]],
             target_platform='rk3588')
 
     # 2. загрузка ONNX

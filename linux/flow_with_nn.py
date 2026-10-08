@@ -104,7 +104,7 @@ w, h, bits = c_int(), c_int(), c_int()
 ksj.KSJ_CaptureGetSizeEx(IDX, byref(w), byref(h), byref(bits))
 W, H, CH = w.value, h.value, bits.value // 8
 buf = create_string_buffer(W * H * CH)
-print("порция %dx%d, набирается %.1f с" % (W, H, piece_sec))
+print("камера готова: порция %dx%d, набирается %.1f с" % (W, H, piece_sec))
 
 # ------------------------------------------------------------------ очереди
 frames = queue.Queue(maxsize=64)      # порции от камеры
@@ -139,7 +139,8 @@ def read_line():
         band = read_line.rows[:, X0:X1]
         background = np.median(band, axis=0).astype(np.int16)
         sat = (band >= 250).mean()
-        if sat > 0.01:
+        if sat > 0.01 and time.time() - read_line.last_warn > 60:
+            read_line.last_warn = time.time()
             print("ПЕРЕСВЕТ: %.1f%% в насыщении" % (100 * sat))
     row = read_line.rows[read_line.pos, X0:X1]
     read_line.pos += 1
@@ -148,6 +149,7 @@ def read_line():
 
 read_line.rows = None
 read_line.pos = 0
+read_line.last_warn = 0.0
 
 date = datetime.datetime.now()
 session_name = date.strftime("%d-%m-%Y_%H-%M-%S")
@@ -192,10 +194,11 @@ def find_obj(image, session_name=None, need_save=True, threshold=(25, 25, 25),
             continue
 
         crop = image[y:y + h_, x:x + w_]          # BGR, как отдаёт камера
+        fname = None
         if need_save:
             fname = f"data/sessions/{session_name}/object_{obj_counter[0]}.png"
             cv2.imwrite(fname, crop)
-        objects.append(crop)
+        objects.append((crop, fname))
         obj_counter[0] += 1
 
     return objects
@@ -235,7 +238,7 @@ class Classifier:
             warm = np.zeros((1, INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8)
             for _ in range(3):
                 self.rknn.inference(inputs=[warm])
-            print("NPU готов, модель:", RKNN_PATH)
+            print("NPU готов:", RKNN_PATH)
         else:
             import torch
             from torchvision import models, transforms
@@ -249,7 +252,7 @@ class Classifier:
             self.model = m
             self.tf = transforms.Normalize([0.485, 0.456, 0.406],
                                            [0.229, 0.224, 0.225])
-            print("torch готов, модель:", TORCH_PATH)
+            print("torch готов:", TORCH_PATH)
 
     def predict(self, crop):
         batch = prepare(crop)
@@ -296,13 +299,12 @@ def capture_loop():
                     obj_rows.append(row)
                     if gap >= GAP_ROWS:
                         image = np.stack(obj_rows)
-                        dt = (time.perf_counter() - t_start) * 1000
-                        print(f"[capture] сбор: {dt:.1f} мс, "
-                              f"строк: {len(obj_rows)}")
                         try:
-                            obj_queue.put_nowait(image)
+                            # t_start - момент, когда объект только появился
+                            # под камерой. От него и считаем полное время.
+                            obj_queue.put_nowait((image, t_start))
                         except queue.Full:
-                            print("[capture] очередь полна, объект пропущен")
+                            print("очередь полна, объект пропущен")
                         obj_rows = []
                         collecting = False
                         gap = 0
@@ -317,26 +319,26 @@ def inference_loop():
     try:
         clf = Classifier(use_rknn=USE_RKNN)
         while running:
-            image = obj_queue.get()
-            t0 = time.perf_counter()
+            image, t_start = obj_queue.get()
+            t_detect = time.perf_counter()
 
             objects = find_obj(image, session_name=session_name,
                                need_save=NEED_SAVE)
-            t1 = time.perf_counter()
+            t_found = time.perf_counter()
 
-            for obj in objects:
-                t3 = time.perf_counter()
-                cls = clf.predict(obj)
-                t4 = time.perf_counter()
-                print(f'  Класс объекта: {CLASSES[cls]}  '
-                      f'({obj.shape[1]}x{obj.shape[0]} px, '
-                      f'инференс {(t4 - t3) * 1000:.1f} мс)')
+            for crop, fname in objects:
+                cls = CLASSES[clf.predict(crop)]
+                t_done = time.perf_counter()
+                # Полное время: от появления объекта под камерой до ответа сети.
+                print("%-8s %4dx%-4d  полное %6.0f мс  "
+                      "(сбор %5.0f, выделение %4.0f, сеть %4.0f)  %s"
+                      % (cls, crop.shape[1], crop.shape[0],
+                         (t_done - t_start) * 1000,
+                         (t_detect - t_start) * 1000,
+                         (t_found - t_detect) * 1000,
+                         (t_done - t_found) * 1000,
+                         os.path.basename(fname) if fname else ''))
 
-            t2 = time.perf_counter()
-            print(f"[infer] find_obj: {(t1 - t0) * 1000:.1f} мс, "
-                  f"объектов: {len(objects)}, "
-                  f"итого цикл: {(t2 - t0) * 1000:.1f} мс")
-            print('/' * 80)
             obj_queue.task_done()
     except Exception:
         import traceback
