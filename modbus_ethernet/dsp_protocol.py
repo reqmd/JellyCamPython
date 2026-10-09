@@ -8,9 +8,12 @@
     python3 dsp_server.py 192.168.2.101 5001
 """
 
+import math
+import random
 import socket
 import struct
 import sys
+import time
 
 UNIT = 1          # адрес устройства
 DSP_STATE = 1     # байт состояния DSP, в ответах всегда 1
@@ -28,9 +31,12 @@ VALVE_COUNT = 64        # регистр 20108, число клапанов (п�
 VALVE_BASE = 20109      # с этого регистра идут позиции клапанов, по одному на клапан
 
 # Сколько регистров класть в один ответный пакет.
-# 0 - весь ответ одним пакетом. 1024 - запрос на 2048 регистров
-# делится на две датаграммы: у первой байт [1] = 0, у второй = 1.
-MAX_REGS_PER_FRAME = 1024
+# 728 - максимум, который влезает в одну датаграмму:
+#   728 * 2 + 14 = 1470 байт при пределе 1472 (MTU 1500 минус заголовки IP и UDP).
+# Запрос на 6144 регистра (3 канала по 2048 пикселей) даёт 8 кадров
+# по 728 регистров и последний на 320: 728 * 8 + 320 = 6144.
+# У всех кадров, кроме последнего, байт [1] равен 0, у последнего - 1.
+MAX_REGS_PER_FRAME = 728
 
 # --------------------------------------------------------------------------
 # Карта регистров. Всё, чего нет в словаре, равно нулю.
@@ -49,6 +55,60 @@ REGISTERS = {
 _step = (FOV_RIGHT - FOV_LEFT) / VALVE_COUNT
 for _i in range(VALVE_COUNT):
     REGISTERS[VALVE_BASE + _i] = round(FOV_LEFT + (_i + 0.5) * _step)
+
+
+# --------------------------------------------------------------------------
+# Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
+# Регистры с адреса 106 идут так:
+#   106 = R пикселя 0, 107 = G пикселя 0, 108 = B пикселя 0,
+#   109 = R пикселя 1, 110 = G пикселя 1, ... и так далее
+# Всего 2048 * 3 = 6144 регистра, адреса 106 .. 6249.
+# Яркость каждого канала - uint8, значения от 0 до 255.
+# Значения генерируются заново на каждый запрос, поэтому график живой.
+# --------------------------------------------------------------------------
+
+RAW_BASE = 106              # сырые данные
+AVG_BASE = 20366            # с какого регистра начинаются данные
+PIXEL_COUNT = 2048          # число пикселей в строке
+CHANNELS = 3                # R, G, B
+
+PIXEL_MAX = 16384             # потолок яркости, uint8
+CHANNEL_LEVEL = (170 * 64, 125 * 64, 80 * 64)   # средняя яркость каналов R, G, B
+NOISE = 50                  # размах шума вокруг среднего, +/- отсчётов
+WAVE_AMPLITUDE = 100         # размах плавной волны вдоль строки
+WAVE_PERIOD = 128           # длина волны в пикселях
+DRIFT_SPEED = 150           # скорость сдвига волны, пикселей в секунду
+
+# По скольким кадрам усредняется второй график. Шум падает как корень
+# из числа кадров: при окне 16 размах уменьшается вчетверо.
+AVERAGE_WINDOW = 16
+AVG_NOISE = max(0, round(NOISE / math.sqrt(AVERAGE_WINDOW)))
+
+# Форма волны считается один раз при запуске, дальше только сдвигается.
+_WAVE = [round(WAVE_AMPLITUDE * math.sin(2 * math.pi * _i / WAVE_PERIOD))
+         for _i in range(PIXEL_COUNT)]
+ 
+BLOCK_SIZE = PIXEL_COUNT * CHANNELS
+RAW_END = RAW_BASE + BLOCK_SIZE
+AVG_END = AVG_BASE + BLOCK_SIZE
+ 
+ 
+def pixel_value(offset: int, shift: int, noise: int) -> int:
+    """Яркость одного канала одного пикселя."""
+    pixel, channel = divmod(offset, CHANNELS)
+    value = CHANNEL_LEVEL[channel] + _WAVE[(pixel + shift) % PIXEL_COUNT]
+    if noise:
+        value += random.randint(-noise, noise)
+    return 0 if value < 0 else (PIXEL_MAX if value > PIXEL_MAX else value)
+ 
+ 
+def register_value(addr: int, shift: int) -> int:
+    """Значение регистра: данные камеры генерируются, остальное из карты."""
+    if RAW_BASE <= addr < RAW_END:
+        return pixel_value(addr - RAW_BASE, shift, NOISE)
+    if AVG_BASE <= addr < AVG_END:
+        return pixel_value(addr - AVG_BASE, shift, AVG_NOISE)
+    return REGISTERS.get(addr, 0)
 
 
 # --------------------------------------------------------------------------
@@ -84,7 +144,8 @@ def build_read_frame(start: int, count: int, last: bool) -> bytes:
     [12..] значения регистров   [n-2..] CRC
     Длина = count * 2 + 14
     """
-    values = [REGISTERS.get(start + i, 0) for i in range(count)]
+    shift = int(time.monotonic() * DRIFT_SPEED)
+    values = [register_value(start + i, shift) for i in range(count)]
     frame = bytes([UNIT, 1 if last else 0, FUNC_READ, DSP_STATE])
     frame += struct.pack(">II", start, count)
     frame += struct.pack(f">{count}H", *values)
