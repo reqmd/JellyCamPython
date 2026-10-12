@@ -8,15 +8,20 @@
     python3 dsp_server.py 192.168.2.101 5001
 """
 
-import json
 import math
-import os
 import random
 import socket
 import struct
 import time
 
-from valve_config import compute_fov, clamp_u16, save_valves, load_valves, apply_valves, store_valve_write
+from valve_config import (
+    REGISTERS,                    # общий словарь регистров, второго быть не должно
+    VALVE_COUNT_REG, VALVE_BASE,
+    VALVE_W_COUNT_REG, VALVE_W_BASE,
+    FOV_LEFT_REG, FOV_RIGHT_REG,
+    CAMERA_TYPE,
+    load_valves, store_valve_write,
+)
 
 UNIT = 1          # адрес устройства
 DSP_STATE = 1     # байт состояния DSP, в ответах всегда 1
@@ -28,25 +33,11 @@ PORT = 5001
 
 # --------------------------------------------------------------------------
 # Параметры устройства
+#
+# Адреса регистров, карта REGISTERS и работа с клапанами живут в
+# valve_config.py и импортируются выше. Дублировать их здесь нельзя:
+# появится второй словарь, и записанное приложением не дойдёт до расчёта.
 # --------------------------------------------------------------------------
-
-CAMERA_TYPE = 10        # регистр 41006
-FOV_LEFT_REG = 20106    # поле зрения, левая граница
-FOV_RIGHT_REG = 20107   # поле зрения, правая граница
-VALVE_COUNT_REG = 20108 # число клапанов
-VALVE_BASE = 20109      # с этого регистра идут позиции клапанов, по одному на клапан
-VALVE_MAX = 128         # потолок числа клапанов
-VALVE_W_COUNT_REG = 20237
-VALVE_W_BASE = 20238
-FOV_LEFT = 1            # начальное поле зрения, пока приложение не прислало клапаны
-FOV_RIGHT = 2047
-VALVE_COUNT = 64        # начальное число клапанов
-FOV_MARGIN = 10         # запас, который формула добавляет за крайними клапанами
-
-# Куда сохраняется конфигурация клапанов, присланная приложением.
-# Файл читается при запуске, поэтому настройки переживают перезапуск сервера.
-VALVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "valves.json")
 
 # Сколько регистров класть в один ответный пакет.
 # 728 - максимум, который влезает в одну датаграмму:
@@ -55,28 +46,6 @@ VALVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # по 728 регистров и последний на 320: 728 * 8 + 320 = 6144.
 # У всех кадров, кроме последнего, байт [1] равен 0, у последнего - 1.
 MAX_REGS_PER_FRAME = 728
-
-# --------------------------------------------------------------------------
-# Карта регистров. Всё, чего нет в словаре, равно нулю.
-# --------------------------------------------------------------------------
-
-REGISTERS = {
-    99: 1,
-    41006: CAMERA_TYPE,
-    FOV_LEFT_REG: FOV_LEFT,
-    FOV_RIGHT_REG: FOV_RIGHT,
-    VALVE_COUNT_REG: VALVE_COUNT,
-    VALVE_W_COUNT_REG: VALVE_COUNT, 
-}
-
-# Клапаны расставлены равномерно по полю зрения, каждый в центре своей полосы.
-# Слоты с VALVE_BASE + VALVE_COUNT по VALVE_BASE + 127 остаются нулевыми.
-_step = (FOV_RIGHT - FOV_LEFT) / VALVE_COUNT
-for _i in range(VALVE_COUNT):
-    _pos = round(FOV_LEFT + (_i + 0.5) * _step)
-    REGISTERS[VALVE_BASE + _i] = _pos
-    REGISTERS[VALVE_W_BASE + _i] = _pos
-
 
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.

@@ -1,40 +1,206 @@
+"""
+Конфигурация устройства и работа с клапанами.
+
+Настройки лежат в отдельном файле рядом со скриптом:
+    config.yaml  - если есть и установлен PyYAML (можно писать комментарии)
+    config.json  - иначе; создаётся автоматически при первом запуске
+
+Карта регистров REGISTERS объявлена ЗДЕСЬ и только здесь. dsp_protocol
+импортирует этот же объект, поэтому запись и чтение работают с одними
+данными. Заводить второй словарь с таким же именем в другом файле нельзя:
+это будут два разных словаря, и записанное в один не увидит другой.
+"""
+
 import json
 import os
 import time
 
+try:
+    import yaml                      # необязательная зависимость
+except ImportError:
+    yaml = None
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_JSON = os.path.join(HERE, "config.json")
+CONFIG_YAML = os.path.join(HERE, "config.yaml")
+
+
 # --------------------------------------------------------------------------
-# Конфигурация клапанов: приём, расчёт поля зрения, сохранение на диск
+# Значения по умолчанию. Файл конфигурации накладывается поверх них,
+# поэтому в нём можно держать только то, что отличается.
 # --------------------------------------------------------------------------
+
+DEFAULTS = {
+    "registers": {
+        "camera_type": 41006,        # тип камеры
+        "fov_left": 20106,           # поле зрения, левая граница
+        "fov_right": 20107,          # поле зрения, правая граница
+        "valve_count_read": 20108,   # число клапанов, блок чтения
+        "valve_base_read": 20109,    # координаты клапанов, блок чтения
+        "valve_count_write": 20237,  # число клапанов, блок записи
+        "valve_base_write": 20238,   # координаты клапанов, блок записи
+    },
+    "device": {
+        "camera_type_value": 10,     # что отдавать в регистре типа камеры
+        "valve_max": 128,            # потолок числа клапанов
+        "fov_margin": 10,            # запас за крайними клапанами
+    },
+    "defaults": {
+        "fov_left": 1,               # поле зрения до первой записи клапанов
+        "fov_right": 2047,
+        "valve_count": 64,           # начальное число клапанов
+    },
+    "storage": {
+        "valve_file": "valves.json",  # куда писать присланную конфигурацию
+    },
+}
+
+
+def _merge(base: dict, over: dict) -> dict:
+    """Накладывает over поверх base, на два уровня вложенности."""
+    result = {k: dict(v) if isinstance(v, dict) else v for k, v in base.items()}
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key].update(value)
+        else:
+            result[key] = value
+    return result
+
+
+def _read_config_file():
+    """Читает config.yaml или config.json. Возвращает словарь или None."""
+    if os.path.exists(CONFIG_YAML):
+        if yaml is None:
+            print(f"найден {CONFIG_YAML}, но модуль PyYAML не установлен "
+                  f"(pip3 install pyyaml); беру настройки по умолчанию")
+            return None
+        try:
+            with open(CONFIG_YAML, encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as e:
+            print(f"не читается {CONFIG_YAML}: {e}; беру настройки по умолчанию")
+            return None
+
+    if os.path.exists(CONFIG_JSON):
+        try:
+            with open(CONFIG_JSON, encoding="utf-8") as f:
+                return json.load(f) or {}
+        except (OSError, ValueError) as e:
+            print(f"не читается {CONFIG_JSON}: {e}; беру настройки по умолчанию")
+            return None
+
+    return None
+
+
+def _write_default_config():
+    """Создаёт config.json со значениями по умолчанию, если файла ещё нет."""
+    try:
+        with open(CONFIG_JSON, "w", encoding="utf-8") as f:
+            json.dump(DEFAULTS, f, ensure_ascii=False, indent=2)
+        print(f"создан файл настроек {CONFIG_JSON}")
+    except OSError as e:
+        print(f"не удалось создать {CONFIG_JSON}: {e}")
+
+
+def _validate(cfg: dict) -> dict:
+    """Проверяет значения и приводит их к целым числам."""
+    for section in ("registers", "device", "defaults"):
+        for key, value in cfg[section].items():
+            try:
+                cfg[section][key] = int(value)
+            except (TypeError, ValueError):
+                print(f"настройка {section}.{key} = {value!r} не число, "
+                      f"беру значение по умолчанию {DEFAULTS[section][key]}")
+                cfg[section][key] = DEFAULTS[section][key]
+
+    reg = cfg["registers"]
+    vmax = cfg["device"]["valve_max"]
+
+    # Блоки клапанов не должны налезать друг на друга.
+    read_end = reg["valve_base_read"] + vmax
+    if reg["valve_count_write"] < read_end:
+        print(f"блок записи ({reg['valve_count_write']}) начинается внутри "
+              f"блока чтения (до {read_end - 1}); проверьте config")
+
+    if reg["valve_base_read"] != reg["valve_count_read"] + 1:
+        print(f"координаты блока чтения должны идти сразу за счётчиком: "
+              f"{reg['valve_count_read']} и {reg['valve_base_read']}")
+    if reg["valve_base_write"] != reg["valve_count_write"] + 1:
+        print(f"координаты блока записи должны идти сразу за счётчиком: "
+              f"{reg['valve_count_write']} и {reg['valve_base_write']}")
+
+    if not 1 <= cfg["defaults"]["valve_count"] <= vmax:
+        print(f"начальное число клапанов {cfg['defaults']['valve_count']} "
+              f"вне диапазона 1..{vmax}, беру {vmax}")
+        cfg["defaults"]["valve_count"] = vmax
+
+    return cfg
+
+
+def load_config() -> dict:
+    """Читает файл настроек, накладывает его поверх умолчаний, проверяет."""
+    raw = _read_config_file()
+    if raw is None:
+        if not os.path.exists(CONFIG_YAML) and not os.path.exists(CONFIG_JSON):
+            _write_default_config()
+        raw = {}
+    return _validate(_merge(DEFAULTS, raw))
+
+
+CONFIG = load_config()
+
+# --------------------------------------------------------------------------
+# Константы, собранные из конфигурации. Имена прежние, поэтому
+# dsp_protocol.py менять не нужно.
+# --------------------------------------------------------------------------
+
+CAMERA_TYPE = CONFIG["device"]["camera_type_value"]
+VALVE_MAX = CONFIG["device"]["valve_max"]
+FOV_MARGIN = CONFIG["device"]["fov_margin"]
+
+CAMERA_TYPE_REG = CONFIG["registers"]["camera_type"]
+FOV_LEFT_REG = CONFIG["registers"]["fov_left"]
+FOV_RIGHT_REG = CONFIG["registers"]["fov_right"]
+VALVE_COUNT_REG = CONFIG["registers"]["valve_count_read"]
+VALVE_BASE = CONFIG["registers"]["valve_base_read"]
+VALVE_W_COUNT_REG = CONFIG["registers"]["valve_count_write"]
+VALVE_W_BASE = CONFIG["registers"]["valve_base_write"]
+
+FOV_LEFT = CONFIG["defaults"]["fov_left"]
+FOV_RIGHT = CONFIG["defaults"]["fov_right"]
+VALVE_COUNT = CONFIG["defaults"]["valve_count"]
 
 # Куда сохраняется конфигурация клапанов, присланная приложением.
 # Файл читается при запуске, поэтому настройки переживают перезапуск сервера.
-VALVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "valves.json")
+VALVE_FILE = os.path.join(HERE, CONFIG["storage"]["valve_file"])
 
 
-### НАДО ПЕРЕПИСАТЬ ПОД ИМПОРТ ИЗ JSON !!!!!!!!!!!!!!!!!!!
-
-CAMERA_TYPE = 10        # регистр 41006
-FOV_LEFT_REG = 20106    # поле зрения, левая граница
-FOV_RIGHT_REG = 20107   # поле зрения, правая граница
-VALVE_COUNT_REG = 20108 # число клапанов
-VALVE_BASE = 20109      # с этого регистра идут позиции клапанов, по одному на клапан
-VALVE_MAX = 128         # потолок числа клапанов
-VALVE_W_COUNT_REG = 20237
-VALVE_W_BASE = 20238
-FOV_LEFT = 1            # начальное поле зрения, пока приложение не прислало клапаны
-FOV_RIGHT = 2047
-VALVE_COUNT = 64        # начальное число клапанов
-FOV_MARGIN = 10         # запас, который формула добавляет за крайними клапанами
+# --------------------------------------------------------------------------
+# Карта регистров. Всё, чего нет в словаре, равно нулю.
+# --------------------------------------------------------------------------
 
 REGISTERS = {
-    99: 1,
-    41006: CAMERA_TYPE,
+    99: 1,                          # связь с устройством установлена
+    CAMERA_TYPE_REG: CAMERA_TYPE,
     FOV_LEFT_REG: FOV_LEFT,
     FOV_RIGHT_REG: FOV_RIGHT,
     VALVE_COUNT_REG: VALVE_COUNT,
     VALVE_W_COUNT_REG: VALVE_COUNT,
 }
 
+# Стартовая раскладка: клапаны равномерно по полю зрения, каждый в центре
+# своей полосы. Заполняются оба блока - и для чтения, и для записи.
+_step = (FOV_RIGHT - FOV_LEFT) / VALVE_COUNT
+for _i in range(VALVE_COUNT):
+    _pos = round(FOV_LEFT + (_i + 0.5) * _step)
+    REGISTERS[VALVE_BASE + _i] = _pos
+    REGISTERS[VALVE_W_BASE + _i] = _pos
+
+
+# --------------------------------------------------------------------------
+# Расчёт поля зрения и сохранение конфигурации клапанов
+# --------------------------------------------------------------------------
 
 def compute_fov(coords):
     """
@@ -61,7 +227,7 @@ def clamp_u16(value: int) -> int:
 
 
 def save_valves(count, coords, left, right):
-    """Сохраняет конфигурацию в JSON рядом со скриптом."""
+    """Сохраняет конфигурацию клапанов рядом со скриптом."""
     data = {
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "valve_count": count,
@@ -80,7 +246,7 @@ def save_valves(count, coords, left, right):
 
 
 def load_valves():
-    """Читает сохранённую конфигурацию при запуске, если файл есть."""
+    """Читает сохранённую конфигурацию клапанов при запуске, если файл есть."""
     if not os.path.exists(VALVE_FILE):
         return False
     try:
@@ -101,8 +267,9 @@ def load_valves():
 
 
 def apply_valves(count, coords, announce=None):
-    """Кладёт конфигурацию в карту регистров и пересчитывает поле зрения."""
-    for count_reg, base in ((VALVE_COUNT_REG, VALVE_BASE), (VALVE_W_COUNT_REG, VALVE_W_BASE)):
+    """Кладёт конфигурацию в оба блока и пересчитывает поле зрения."""
+    for count_reg, base in ((VALVE_COUNT_REG, VALVE_BASE),
+                            (VALVE_W_COUNT_REG, VALVE_W_BASE)):
         REGISTERS[count_reg] = count
         for i in range(VALVE_MAX):
             REGISTERS[base + i] = coords[i] if i < count else 0
@@ -125,8 +292,9 @@ def apply_valves(count, coords, announce=None):
 
 def store_valve_write(count_reg, base):
     """
-    Вызывается после записи в блок клапанов. Берёт из карты регистров
-    число клапанов и координаты, пересчитывает поле зрения, пишет файл.
+    Вызывается после записи в блок клапанов. Берёт число клапанов и
+    координаты из того блока, куда писали, пересчитывает поле зрения,
+    раскладывает по обоим блокам и пишет файл.
     """
     count = REGISTERS.get(count_reg, 0)
     if not 1 <= count <= VALVE_MAX:
@@ -141,4 +309,3 @@ def store_valve_write(count_reg, base):
 
     left, right = apply_valves(count, coords)
     save_valves(count, coords, left, right)
-
