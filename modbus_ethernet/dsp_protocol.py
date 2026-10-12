@@ -14,6 +14,7 @@ import socket
 import struct
 import time
 
+import capture
 from valve_config import (
     REGISTERS,                    # общий словарь регистров, второго быть не должно
     VALVE_COUNT_REG, VALVE_BASE,
@@ -46,6 +47,11 @@ PORT = 5001
 # по 728 регистров и последний на 320: 728 * 8 + 320 = 6144.
 # У всех кадров, кроме последнего, байт [1] равен 0, у последнего - 1.
 MAX_REGS_PER_FRAME = 728
+
+# Потолок на длину одного запроса чтения: защита от мусора в поле длины.
+# Поднят до размера полного снимка, чтобы приложение могло забрать
+# изображение целиком одним запросом.
+MAX_READ_REGS = max(30000, capture.MAX_HEIGHT * capture.WIDTH * capture.CHANNELS)
 
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
@@ -96,8 +102,16 @@ def pixel_value(offset: int, shift: int, noise: int) -> int:
     return 0 if value < 0 else (PIXEL_MAX if value > PIXEL_MAX else value)
 
 
-def register_value(addr: int, shift: int) -> int:
+def register_value(addr: int, shift: int, image_mode: bool = False) -> int:
     """Значение регистра: данные камеры генерируются, остальное из карты."""
+    # Чтение снятого изображения. Режим включается на весь запрос целиком
+    # (см. build_read_response), поэтому длинное чтение снимка не перекрывает
+    # регистры клапанов и усреднённого графика, лежащие выше по адресам.
+    if image_mode:
+        shot = capture.image_value(addr - RAW_BASE)
+        if shot is not None:
+            return shot
+
     if RAW_BASE <= addr < RAW_END:
         return pixel_value(addr - RAW_BASE, shift, NOISE)
     if AVG_BASE <= addr < AVG_END:
@@ -131,7 +145,8 @@ def crc_ok(frame: bytes) -> bool:
 # Сборка ответов
 # --------------------------------------------------------------------------
 
-def build_read_frame(start: int, count: int, last: bool) -> bytes:
+def build_read_frame(start: int, count: int, last: bool,
+                     image_mode: bool = False) -> bytes:
     """
     [0] адрес устройства   [1] 1 = последний фрейм   [2] 3   [3] состояние DSP
     [4..7] адрес начального регистра   [8..11] число регистров
@@ -139,7 +154,7 @@ def build_read_frame(start: int, count: int, last: bool) -> bytes:
     Длина = count * 2 + 14
     """
     shift = int(time.monotonic() * DRIFT_SPEED)
-    values = [register_value(start + i, shift) for i in range(count)]
+    values = [register_value(start + i, shift, image_mode) for i in range(count)]
     frame = bytes([UNIT, 1 if last else 0, FUNC_READ, DSP_STATE])
     frame += struct.pack(">II", start, count)
     frame += struct.pack(f">{count}H", *values)
@@ -148,15 +163,20 @@ def build_read_frame(start: int, count: int, last: bool) -> bytes:
 
 def build_read_response(start: int, count: int) -> list:
     """Один кадр или несколько, если включено деление."""
+    # Запрос считается чтением снимка, если он начинается с блока данных
+    # и снимок готов. Решение принимается один раз на весь запрос, чтобы
+    # длинное чтение изображения не задело регистры с другими адресами.
+    image_mode = start == RAW_BASE and capture.is_ready()
+
     if not MAX_REGS_PER_FRAME or count <= MAX_REGS_PER_FRAME:
-        return [build_read_frame(start, count, True)]
+        return [build_read_frame(start, count, True, image_mode)]
 
     frames = []
     sent = 0
     while sent < count:
         chunk = min(MAX_REGS_PER_FRAME, count - sent)
         last = sent + chunk >= count
-        frames.append(build_read_frame(start + sent, chunk, last))
+        frames.append(build_read_frame(start + sent, chunk, last, image_mode))
         sent += chunk
     return frames
 
@@ -183,7 +203,9 @@ def handle(data: bytes) -> list:
     start, count = struct.unpack(">II", data[3:11])
 
     if func == FUNC_READ:
-        if count == 0 or count > 30000:
+        if count == 0 or count > MAX_READ_REGS:
+            print(f"чтение: регистр {start}, количество {count} -- "
+                  f"вне допустимого (1..{MAX_READ_REGS}), игнорирую")
             return []
         frames = build_read_response(start, count)
         print(f"чтение: регистр {start}, количество {count}"
@@ -208,6 +230,9 @@ def handle(data: bytes) -> list:
             if start <= count_reg < start + count:
                 store_valve_write(count_reg, base)
                 break
+
+        # Команды съёмки и служебные регистры.
+        capture.on_write(start, values)
 
         return [build_write_response(start, count)]
 
