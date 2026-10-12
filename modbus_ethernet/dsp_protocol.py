@@ -8,27 +8,45 @@
     python3 dsp_server.py 192.168.2.101 5001
 """
 
+import json
 import math
+import os
 import random
 import socket
 import struct
-import sys
 import time
+
+from valve_config import compute_fov, clamp_u16, save_valves, load_valves, apply_valves, store_valve_write
 
 UNIT = 1          # адрес устройства
 DSP_STATE = 1     # байт состояния DSP, в ответах всегда 1
 FUNC_READ = 0x03
 FUNC_WRITE = 0x10
 
+IP_ADDRESS = '192.168.2.101'
+PORT = 5001
+
 # --------------------------------------------------------------------------
 # Параметры устройства
 # --------------------------------------------------------------------------
 
 CAMERA_TYPE = 10        # регистр 41006
-FOV_LEFT = 1            # регистр 20106, левая граница поля зрения
-FOV_RIGHT = 2047        # регистр 20107, правая граница
-VALVE_COUNT = 64        # регистр 20108, число клапанов (потолок 128)
+FOV_LEFT_REG = 20106    # поле зрения, левая граница
+FOV_RIGHT_REG = 20107   # поле зрения, правая граница
+VALVE_COUNT_REG = 20108 # число клапанов
 VALVE_BASE = 20109      # с этого регистра идут позиции клапанов, по одному на клапан
+VALVE_MAX = 128         # потолок числа клапанов
+VALVE_W_COUNT_REG = 20237
+VALVE_W_BASE = 20238
+FOV_LEFT = 1            # начальное поле зрения, пока приложение не прислало клапаны
+FOV_RIGHT = 2047
+VALVE_COUNT = 64        # начальное число клапанов
+FOV_MARGIN = 10         # запас, который формула добавляет за крайними клапанами
+
+# Куда сохраняется конфигурация клапанов, присланная приложением.
+# Файл читается при запуске, поэтому настройки переживают перезапуск сервера.
+VALVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "valves.json")
 
 # Сколько регистров класть в один ответный пакет.
 # 728 - максимум, который влезает в одну датаграмму:
@@ -43,32 +61,39 @@ MAX_REGS_PER_FRAME = 728
 # --------------------------------------------------------------------------
 
 REGISTERS = {
-    99: 1,                  # связь с устройством установлена
-    41006: CAMERA_TYPE,     # тип камеры
-    20106: FOV_LEFT,        # поле зрения, левая граница
-    20107: FOV_RIGHT,       # поле зрения, правая граница
-    20108: VALVE_COUNT,     # число клапанов
+    99: 1,
+    41006: CAMERA_TYPE,
+    FOV_LEFT_REG: FOV_LEFT,
+    FOV_RIGHT_REG: FOV_RIGHT,
+    VALVE_COUNT_REG: VALVE_COUNT,
+    VALVE_W_COUNT_REG: VALVE_COUNT, 
 }
 
 # Клапаны расставлены равномерно по полю зрения, каждый в центре своей полосы.
 # Слоты с VALVE_BASE + VALVE_COUNT по VALVE_BASE + 127 остаются нулевыми.
 _step = (FOV_RIGHT - FOV_LEFT) / VALVE_COUNT
 for _i in range(VALVE_COUNT):
-    REGISTERS[VALVE_BASE + _i] = round(FOV_LEFT + (_i + 0.5) * _step)
+    _pos = round(FOV_LEFT + (_i + 0.5) * _step)
+    REGISTERS[VALVE_BASE + _i] = _pos
+    REGISTERS[VALVE_W_BASE + _i] = _pos
 
 
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
-# Регистры с адреса 106 идут так:
-#   106 = R пикселя 0, 107 = G пикселя 0, 108 = B пикселя 0,
-#   109 = R пикселя 1, 110 = G пикселя 1, ... и так далее
-# Всего 2048 * 3 = 6144 регистра, адреса 106 .. 6249.
-# Яркость каждого канала - uint8, значения от 0 до 255.
+# Регистры идут так:
+#   база + 0 = R пикселя 0, база + 1 = G пикселя 0, база + 2 = B пикселя 0,
+#   база + 3 = R пикселя 1, база + 4 = G пикселя 1, ... и так далее
+# Всего 2048 * 3 = 6144 регистра. Яркость каждого канала - uint8, 0 .. 255.
+#
+# Блоков два, график у них одинаковый:
+#   106   .. 6249   сырые данные, с полным шумом
+#   20366 .. 26509  усреднённые данные, шум подавлен
+#
 # Значения генерируются заново на каждый запрос, поэтому график живой.
 # --------------------------------------------------------------------------
 
 RAW_BASE = 106              # сырые данные
-AVG_BASE = 20366            # с какого регистра начинаются данные
+AVG_BASE = 20366            # усреднённые данные
 PIXEL_COUNT = 2048          # число пикселей в строке
 CHANNELS = 3                # R, G, B
 
@@ -87,12 +112,12 @@ AVG_NOISE = max(0, round(NOISE / math.sqrt(AVERAGE_WINDOW)))
 # Форма волны считается один раз при запуске, дальше только сдвигается.
 _WAVE = [round(WAVE_AMPLITUDE * math.sin(2 * math.pi * _i / WAVE_PERIOD))
          for _i in range(PIXEL_COUNT)]
- 
+
 BLOCK_SIZE = PIXEL_COUNT * CHANNELS
 RAW_END = RAW_BASE + BLOCK_SIZE
 AVG_END = AVG_BASE + BLOCK_SIZE
- 
- 
+
+
 def pixel_value(offset: int, shift: int, noise: int) -> int:
     """Яркость одного канала одного пикселя."""
     pixel, channel = divmod(offset, CHANNELS)
@@ -100,8 +125,8 @@ def pixel_value(offset: int, shift: int, noise: int) -> int:
     if noise:
         value += random.randint(-noise, noise)
     return 0 if value < 0 else (PIXEL_MAX if value > PIXEL_MAX else value)
- 
- 
+
+
 def register_value(addr: int, shift: int) -> int:
     """Значение регистра: данные камеры генерируются, остальное из карты."""
     if RAW_BASE <= addr < RAW_END:
@@ -197,23 +222,39 @@ def handle(data: bytes) -> list:
         return frames
 
     if func == FUNC_WRITE:
-        values = struct.unpack(f">{count}H", data[11:11 + count * 2])
-        print(f"запись: регистр {start} = {list(values)}")
+        if count == 0 or len(data) != count * 2 + 13:
+            return []
+        values = list(struct.unpack(f">{count}H", data[11:11 + count * 2]))
+
+        shown = values if count <= 8 else values[:8] + ["..."]
+        print(f"запись: регистр {start}, количество {count}, значения {shown}")
+
+        # Записанное попадает в карту регистров, чтобы его можно было прочитать.
+        for i, v in enumerate(values):
+            REGISTERS[start + i] = v
+
+        # Если запись затронула регистр с числом клапанов - разбираем блок,
+        # пересчитываем поле зрения и сохраняем конфигурацию на диск.
+        for count_reg, base in ((VALVE_W_COUNT_REG, VALVE_W_BASE), (VALVE_COUNT_REG, VALVE_BASE)):
+            if start <= count_reg < start + count:
+                store_valve_write(count_reg, base)
+                break
+
         return [build_write_response(start, count)]
 
     return []
 
 
 def main():
-    host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5001
+    load_valves()          # если есть сохранённая конфигурация - поднимаем её
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-    sock.bind((host, port))
-    print(f"слушаю {host}:{port}, адрес устройства {UNIT}")
-    print(f"тип камеры {CAMERA_TYPE}, поле зрения {FOV_LEFT}..{FOV_RIGHT}, "
-          f"клапанов {VALVE_COUNT}")
+    sock.bind((IP_ADDRESS, PORT))
+    print(f"слушаю {IP_ADDRESS}:{PORT}, адрес устройства {UNIT}")
+    print(f"тип камеры {CAMERA_TYPE}, "
+          f"поле зрения {REGISTERS[FOV_LEFT_REG]}..{REGISTERS[FOV_RIGHT_REG]}, "
+          f"клапанов {REGISTERS[VALVE_COUNT_REG]}")
 
     while True:
         data, addr = sock.recvfrom(65535)

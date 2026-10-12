@@ -17,3 +17,5 @@ ribbon.png
 check0_base_optimize.onnx
 check2_correct_ops.onnx
 check3_fuse_ops.onnx
+modbus_ethernet/__pycache__
+modbus_ethernet/valves.json
