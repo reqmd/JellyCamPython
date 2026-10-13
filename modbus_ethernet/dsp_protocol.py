@@ -49,9 +49,17 @@ PORT = 5001
 MAX_REGS_PER_FRAME = 728
 
 # Потолок на длину одного запроса чтения: защита от мусора в поле длины.
-# Поднят до размера полного снимка, чтобы приложение могло забрать
-# изображение целиком одним запросом.
-MAX_READ_REGS = max(30000, capture.MAX_HEIGHT * capture.WIDTH * capture.CHANNELS)
+# Поднят до размера полного снимка (2048 * H * 3 / 2 регистров), чтобы
+# приложение могло забрать изображение целиком одним запросом.
+MAX_READ_REGS = max(30000, capture.WIDTH * capture.MAX_HEIGHT
+                    * capture.CHANNELS // 2)
+
+# Пауза между датаграммами одного ответа, в секундах.
+# Снимок - это больше двух тысяч датаграмм подряд, и приёмный буфер
+# приложения может не успевать их забирать: в Wireshark пакеты при этом
+# видны, а до программы доходит не всё, и картинка получается чёрной.
+# 0 - слать без пауз. Если видны потери, начните с 0.0002.
+FRAME_DELAY = 0.0
 
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
@@ -102,20 +110,24 @@ def pixel_value(offset: int, shift: int, noise: int) -> int:
     return 0 if value < 0 else (PIXEL_MAX if value > PIXEL_MAX else value)
 
 
-def register_value(addr: int, shift: int, image_mode: bool = False) -> int:
+def register_value(addr: int, shift: int) -> int:
     """Значение регистра: данные камеры генерируются, остальное из карты."""
-    # Чтение снятого изображения. Режим включается на весь запрос целиком
-    # (см. build_read_response), поэтому длинное чтение снимка не перекрывает
-    # регистры клапанов и усреднённого графика, лежащие выше по адресам.
-    if image_mode:
-        shot = capture.image_value(addr - RAW_BASE)
-        if shot is not None:
-            return shot
+    # Регистр состояния съёмки: метка, пока идёт съёмка, потом высота.
+    if addr == capture.STATUS_REG:
+        return capture.status_value()
+
+    shot = capture.photo_value(addr)
+    if shot is not None:
+        return shot
 
     if RAW_BASE <= addr < RAW_END:
         return pixel_value(addr - RAW_BASE, shift, NOISE)
     if AVG_BASE <= addr < AVG_END:
-        return pixel_value(addr - AVG_BASE, shift, AVG_NOISE)
+        # После съёмки этот блок отдаёт стабильный фон кадра,
+        # до съёмки - усреднённый живой график.
+        back = capture.background_value(addr - AVG_BASE)
+        return back if back is not None else pixel_value(addr - AVG_BASE,
+                                                         shift, AVG_NOISE)
     return REGISTERS.get(addr, 0)
 
 
@@ -123,13 +135,29 @@ def register_value(addr: int, shift: int, image_mode: bool = False) -> int:
 # Контрольная сумма
 # --------------------------------------------------------------------------
 
-def crc16(data: bytes) -> int:
-    """CRC-16/MODBUS, в кадре идёт старшим байтом вперёд."""
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
+def _make_crc_table():
+    """Таблица для CRC-16/MODBUS: полином 0xA001, по байту за шаг."""
+    table = []
+    for i in range(256):
+        crc = i
         for _ in range(8):
             crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+
+_CRC_TABLE = _make_crc_table()
+
+
+def crc16(data: bytes) -> int:
+    """
+    CRC-16/MODBUS, в кадре идёт старшим байтом вперёд.
+    Считается по таблице: на передачу снимка приходится больше трёх
+    мегабайт, и побитовый вариант там становится заметен.
+    """
+    crc = 0xFFFF
+    for b in data:
+        crc = (crc >> 8) ^ _CRC_TABLE[(crc ^ b) & 0xFF]
     return crc
 
 
@@ -145,40 +173,45 @@ def crc_ok(frame: bytes) -> bool:
 # Сборка ответов
 # --------------------------------------------------------------------------
 
-def build_read_frame(start: int, count: int, last: bool,
-                     image_mode: bool = False) -> bytes:
+def build_read_frame(start: int, count: int, last: bool) -> bytes:
     """
     [0] адрес устройства   [1] 1 = последний фрейм   [2] 3   [3] состояние DSP
     [4..7] адрес начального регистра   [8..11] число регистров
     [12..] значения регистров   [n-2..] CRC
     Длина = count * 2 + 14
     """
-    shift = int(time.monotonic() * DRIFT_SPEED)
-    values = [register_value(start + i, shift, image_mode) for i in range(count)]
+    # Блок изображения отдаём срезом готового массива: поштучная сборка
+    # полутора миллионов регистров была бы слишком медленной.
+    values = capture.photo_slice(start, count)
+    if values is None:
+        shift = int(time.monotonic() * DRIFT_SPEED)
+        values = [register_value(start + i, shift) for i in range(count)]
     frame = bytes([UNIT, 1 if last else 0, FUNC_READ, DSP_STATE])
     frame += struct.pack(">II", start, count)
     frame += struct.pack(f">{count}H", *values)
     return with_crc(frame)
 
 
-def build_read_response(start: int, count: int) -> list:
-    """Один кадр или несколько, если включено деление."""
-    # Запрос считается чтением снимка, если он начинается с блока данных
-    # и снимок готов. Решение принимается один раз на весь запрос, чтобы
-    # длинное чтение изображения не задело регистры с другими адресами.
-    image_mode = start == RAW_BASE and capture.is_ready()
+def iter_read_frames(start: int, count: int):
+    """
+    Кадры ответа по одному, генератором.
 
+    Это важно для снимка: если собрать все 2161 кадр заранее, первый байт
+    уходит почти через полсекунды. Приложение столько не ждёт - оно
+    начинает запрашивать куски поштучно, а наши запоздалые ответы на эти
+    запросы приходят уже после всего потока и сбивают ему сборку.
+    Генератор отдаёт первый кадр сразу, как только он готов.
+    """
     if not MAX_REGS_PER_FRAME or count <= MAX_REGS_PER_FRAME:
-        return [build_read_frame(start, count, True, image_mode)]
+        yield build_read_frame(start, count, True)
+        return
 
-    frames = []
     sent = 0
     while sent < count:
         chunk = min(MAX_REGS_PER_FRAME, count - sent)
         last = sent + chunk >= count
-        frames.append(build_read_frame(start + sent, chunk, last, image_mode))
+        yield build_read_frame(start + sent, chunk, last)
         sent += chunk
-    return frames
 
 
 def build_write_response(start: int, count: int) -> bytes:
@@ -192,8 +225,12 @@ def build_write_response(start: int, count: int) -> bytes:
 # Обработка запроса
 # --------------------------------------------------------------------------
 
-def handle(data: bytes) -> list:
-    """Возвращает список кадров ответа (может быть пустым)."""
+def handle(data: bytes):
+    """
+    Возвращает кадры ответа: список для записи, генератор для чтения.
+    Разбор запроса и все побочные действия выполняются сразу, а кадры
+    чтения собираются по мере отправки.
+    """
     if len(data) < 13 or not crc_ok(data):
         return []
     if data[0] != UNIT:
@@ -207,10 +244,11 @@ def handle(data: bytes) -> list:
             print(f"чтение: регистр {start}, количество {count} -- "
                   f"вне допустимого (1..{MAX_READ_REGS}), игнорирую")
             return []
-        frames = build_read_response(start, count)
+        per = MAX_REGS_PER_FRAME or count
+        parts = -(-count // per)          # округление вверх
         print(f"чтение: регистр {start}, количество {count}"
-              f"{f', ответ из {len(frames)} фрагментов' if len(frames) > 1 else ''}")
-        return frames
+              f"{f', ответ из {parts} фрагментов' if parts > 1 else ''}")
+        return iter_read_frames(start, count)
 
     if func == FUNC_WRITE:
         if count == 0 or len(data) != count * 2 + 13:
@@ -243,7 +281,7 @@ def main():
     load_valves()          # если есть сохранённая конфигурация - поднимаем её
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
     sock.bind((IP_ADDRESS, PORT))
     print(f"слушаю {IP_ADDRESS}:{PORT}, адрес устройства {UNIT}")
     print(f"тип камеры {CAMERA_TYPE}, "
@@ -252,8 +290,12 @@ def main():
 
     while True:
         data, addr = sock.recvfrom(65535)
+        first = True
         for frame in handle(data):
+            if FRAME_DELAY and not first:
+                time.sleep(FRAME_DELAY)
             sock.sendto(frame, addr)
+            first = False
 
 
 if __name__ == "__main__":
