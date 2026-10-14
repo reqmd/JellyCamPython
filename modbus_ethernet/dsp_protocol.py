@@ -173,6 +173,24 @@ def crc_ok(frame: bytes) -> bool:
 # Сборка ответов
 # --------------------------------------------------------------------------
 
+def graph_slice(start: int, count: int):
+    """
+    Кусок графика, если его даёт камера.
+
+    Блок 106 показывает текущую строку сенсора, блок 20366 - усреднённую.
+    Пока камеры нет, возвращается None, и график рисуется генератором,
+    как раньше.
+    """
+    live, avg = capture.graph_lines()
+    for base, data in ((RAW_BASE, live), (AVG_BASE, avg)):
+        if data is None:
+            continue
+        offset = start - base
+        if 0 <= offset and offset + count <= data.size:
+            return data[offset:offset + count].tolist()
+    return None
+
+
 def build_read_frame(start: int, count: int, last: bool) -> bytes:
     """
     [0] адрес устройства   [1] 1 = последний фрейм   [2] 3   [3] состояние DSP
@@ -183,6 +201,8 @@ def build_read_frame(start: int, count: int, last: bool) -> bytes:
     # Блок изображения отдаём срезом готового массива: поштучная сборка
     # полутора миллионов регистров была бы слишком медленной.
     values = capture.photo_slice(start, count)
+    if values is None:
+        values = graph_slice(start, count)      # строка с камеры, если есть
     if values is None:
         shift = int(time.monotonic() * DRIFT_SPEED)
         values = [register_value(start + i, shift) for i in range(count)]

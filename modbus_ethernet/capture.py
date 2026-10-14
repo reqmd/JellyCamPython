@@ -60,11 +60,13 @@ MAX_HEIGHT = 4096        # потолок высоты снимка
 BACKGROUND = (0, 0, 255)  # стабильный фон кадра: синий
 DELAY_SEC = 1.0           # сколько длится съёмка
 MIN_BYTE = 1              # нижняя граница яркости, см. комментарий в shoot()
+WAIT_REPORT_SEC = 2.0     # как часто сообщать, что всё ещё ждём предмет
 
 # Упакованное изображение: numpy uint16, по два байта в регистре.
 _packed = None
 _height = 0
 _busy_since = None        # момент получения метки, пока идёт съёмка
+_waiting_reported = 0.0   # когда последний раз сообщали об ожидании
 
 
 def _frame_from_file():
@@ -88,8 +90,26 @@ def prepare():
     """
     if MODE == MODE_LINE_CAMERA:
         import line_camera
-        print("запускаю линейную камеру в фоне")
+        print("режим съёмки: 2 - линейная камера, запускаю её в фоне")
         line_camera.begin()
+    else:
+        ok = os.path.exists(IMAGE_FILE)
+        print(f"режим съёмки: 1 - картинка с диска {IMAGE_FILE}"
+              f"{'' if ok else '  <- ФАЙЛА НЕТ, снимать будет нечего'}")
+
+
+def graph_lines():
+    """
+    Строки для графика: (живая, усреднённая) или (None, None).
+
+    В режиме камеры приложение видит в блоках 106 и 20366 настоящую строку
+    с сенсора вместо генерируемого шума. Пока камера не поднялась, обе
+    строки None, и сервер рисует прежний синтетический график.
+    """
+    if MODE != MODE_LINE_CAMERA:
+        return None, None
+    import line_camera
+    return line_camera.live_graph(), line_camera.average_graph()
 
 
 def _frame_from_camera():
@@ -159,8 +179,10 @@ def on_write(start, values):
                   f"ждём метку {BUSY_VALUE} в регистре {STATUS_REG}")
 
     if start <= STATUS_REG < start + len(values):
+        global _waiting_reported
         if values[STATUS_REG - start] == BUSY_VALUE:
             _busy_since = time.monotonic()
+            _waiting_reported = 0.0
             if MODE == MODE_LINE_CAMERA:
                 import line_camera
                 line_camera.arm()       # годится только предмет, снятый после
@@ -181,10 +203,20 @@ def status_value() -> int:
     """
     global _busy_since
 
+    global _waiting_reported
+
     if _busy_since is not None:
         if MODE == MODE_LINE_CAMERA:
             img = get_frame()                    # None, пока предмет не проехал
             if img is None:
+                # Раз в WAIT_REPORT_SEC говорим, чего ждём: иначе в логе
+                # видны только опросы регистра, и непонятно, жив ли детектор.
+                waited = time.monotonic() - _busy_since
+                if waited - _waiting_reported >= WAIT_REPORT_SEC:
+                    _waiting_reported = waited
+                    import line_camera
+                    print(f"  жду предмет {waited:.0f} с, "
+                          f"камера: {line_camera.status()}")
                 return BUSY_VALUE
         else:
             if time.monotonic() - _busy_since < DELAY_SEC:

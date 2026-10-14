@@ -83,6 +83,19 @@ BUFFER_ROWS = 2048
 
 QUEUE_SIZE = 64
 
+# --------------------------------------------------------------------------
+# График яркости строки - то, что приложение читает из блоков 106 и 20366.
+#
+# Камера отдаёт байты 0..255, а приложение рисует график в шкале до 16384
+# (так же, как её рисовал генератор до подключения камеры). Поэтому
+# значения домножаются на 64: 255 * 64 = 16320.
+# --------------------------------------------------------------------------
+
+GRAPH_SCALE = 64            # множитель под шкалу приложения
+GRAPH_MAX = 16383           # потолок после домножения
+GRAPH_ALPHA = 0.05          # вес новой строки в усреднённом графике
+GRAPH_PERIOD_SEC = 0.05     # как часто обновлять график, 20 раз в секунду
+
 
 class CameraError(RuntimeError):
     pass
@@ -117,7 +130,20 @@ class ObjectDetector:
         self.seen = deque(maxlen=200)   # уже отданные объекты
         self.pending = []           # ждут строк снизу для центрирования
         self.idle = 0               # порций, пропущенных как пустые
+        self.gaps = 0               # разрывов потока (потерянные порции)
         self.short_buffer_warned = False
+
+    def note_gap(self):
+        """
+        Отметить разрыв потока - потерянную порцию.
+
+        Окно при этом НЕ сбрасывается: проверено, что одну-две потерянные
+        порции детекция переживает и объект всё равно находит, а сброс
+        выбросил бы окно вместе с объектом. Начиная примерно с пяти
+        потерянных подряд объект теряется в любом случае, и единственное
+        лечение - разгрузить детектор, а не чинить последствия.
+        """
+        self.gaps += 1
 
     # --- маска порции ---------------------------------------------------
 
@@ -227,7 +253,9 @@ class LineCamera:
         self.frames = queue.Queue(maxsize=QUEUE_SIZE)
         self.errors = {}
         self.grabbed = 0
+        self.dropped = 0
         self.objects = 0
+        self.detector = None
 
         self._latest = None
         self._latest_id = 0
@@ -235,6 +263,37 @@ class LineCamera:
         self._lock = threading.Lock()
         self._running = False
         self._threads = []
+
+        # График: плоские массивы R,G,B по пикселям, готовые к отправке.
+        self._live_graph = None
+        self._avg_graph = None
+        self._avg_acc = None            # накопитель усреднения, float32
+        self._graph_at = 0.0            # когда обновляли последний раз
+
+    def _update_graph(self, piece):
+        """
+        Готовит строку для графика. Вызывается не чаще GRAPH_PERIOD_SEC,
+        чтобы не отнимать время у детекции.
+        """
+        now = time.monotonic()
+        if now - self._graph_at < GRAPH_PERIOD_SEC:
+            return
+        self._graph_at = now
+
+        # Камера отдаёт BGR, приложение ждёт R, G, B - разворачиваем каналы.
+        line = piece[0][:, ::-1].astype(np.float32)
+
+        if self._avg_acc is None:
+            self._avg_acc = line.copy()
+        else:
+            self._avg_acc += GRAPH_ALPHA * (line - self._avg_acc)
+
+        def pack(arr):
+            v = np.clip(arr * GRAPH_SCALE, 0, GRAPH_MAX)
+            return v.reshape(-1).astype(np.uint16)
+
+        self._live_graph = pack(line)
+        self._avg_graph = pack(self._avg_acc)
 
     # --- подключение ----------------------------------------------------
 
@@ -315,6 +374,7 @@ class LineCamera:
     def _grabber(self):
         """Только забирает порции и кладёт в очередь, без обработки."""
         buf = create_string_buffer(self.width * self.height * self.channels)
+        seq = 0
         while self._running:
             rc = self.ksj.KSJ_CaptureRgbData(IDX, buf)
             if rc < 0:
@@ -324,23 +384,43 @@ class LineCamera:
                           f"(всего {self.errors[rc]})")
                 continue
             self.grabbed += 1
+            seq += 1
             piece = np.frombuffer(buf, np.uint8).reshape(
                 self.height, self.width, self.channels).copy()
             try:
-                self.frames.put_nowait(piece)
+                # Номер порции нужен детектору: по пропуску в нумерации он
+                # понимает, что поток разорвался, и сбрасывает окно.
+                self.frames.put_nowait((seq, piece))
             except queue.Full:
-                self.errors["очередь"] = self.errors.get("очередь", 0) + 1
+                self.dropped += 1
+                if self.dropped in (1, 10, 100, 1000):
+                    print(f"  камера: детекция не успевает, порция потеряна "
+                          f"(всего {self.dropped}); "
+                          f"увеличьте LINES или уменьшите FIXED_RATE")
 
     def _detector(self, background):
         det = ObjectDetector(background, self.height)
+        self.detector = det
         print(f"  окно {det.win_pieces} порций = {det.win_rows} строк "
               f"({det.win_rows / ROWS_PER_SEC * 1000:.0f} мс), "
               f"буфер {det.buf_pieces} порций")
+        expected = None
         while self._running:
             try:
-                piece = self.frames.get(timeout=1.0)
+                seq, piece = self.frames.get(timeout=1.0)
             except queue.Empty:
                 continue
+
+            if expected is not None and seq != expected:
+                det.note_gap()
+                if det.gaps in (1, 10, 100):
+                    print(f"  камера: разрыв потока, пропущено "
+                          f"{seq - expected} порций подряд "
+                          f"(всего разрывов {det.gaps}); "
+                          f"от пяти подряд объект теряется")
+            expected = seq + 1
+            self._update_graph(piece)
+
             for frame in det.feed(piece):
                 self.objects += 1
                 with self._lock:
@@ -413,9 +493,18 @@ class LineCamera:
             self._wanted_after = self._latest_id
             return self._latest
 
+    def live_graph(self):
+        return self._live_graph
+
+    def average_graph(self):
+        return self._avg_graph
+
     def status(self):
-        return (f"порций {self.grabbed}, объектов {self.objects}, "
-                f"ошибки {self.errors or 'нет'}")
+        gaps = self.detector.gaps if self.detector else 0
+        idle = self.detector.idle if self.detector else 0
+        return (f"порций {self.grabbed}, потеряно {self.dropped}, "
+                f"разрывов {gaps}, пустых окон {idle}, "
+                f"объектов {self.objects}, ошибки {self.errors or 'нет'}")
 
 
 # --------------------------------------------------------------------------
@@ -478,6 +567,16 @@ def take():
     if _camera is None:
         return None
     return _camera.take()
+
+
+def live_graph():
+    """Текущая строка для графика: R,G,B подряд по пикселям. None, если нет."""
+    return None if _camera is None else _camera.live_graph()
+
+
+def average_graph():
+    """Усреднённая строка для графика. None, если камеры нет."""
+    return None if _camera is None else _camera.average_graph()
 
 
 def status():
@@ -586,9 +685,53 @@ def selftest():
     return ok
 
 
+def show_graph():
+    """
+    Живой график яркости строки, как в graph.py. Нужен дисплей.
+
+    Берёт ту же строку, что уходит приложению, поэтому годится для
+    настройки освещения и усиления: что видно здесь, то увидит и
+    приложение в блоке 106.
+    """
+    import matplotlib.pyplot as plt
+
+    begin()
+    while not ready() and not failed():
+        time.sleep(0.1)
+    if failed():
+        raise SystemExit(1)
+
+    x = np.arange(SENSOR_WIDTH)
+    plt.ion()
+    fig, ax = plt.subplots()
+    lines = [ax.plot(x, np.zeros(SENSOR_WIDTH), c + '-', label=n)[0]
+             for c, n in (('r', 'R'), ('g', 'G'), ('b', 'B'))]
+    ax.set_ylim(0, GRAPH_MAX)
+    ax.set_xlim(0, SENSOR_WIDTH)
+    ax.set_xlabel('Линия пикселей')
+    ax.set_ylabel('Яркость')
+    ax.legend()
+
+    while plt.fignum_exists(fig.number):
+        flat = live_graph()
+        if flat is None:
+            plt.pause(0.05)
+            continue
+        rgb = flat.reshape(SENSOR_WIDTH, 3)
+        for i, ln in enumerate(lines):
+            ln.set_ydata(rgb[:, i])
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        plt.pause(0.02)
+    stop()
+
+
 def main():
     if "--selftest" in sys.argv:
         raise SystemExit(0 if selftest() else 1)
+    if "--graph" in sys.argv:
+        show_graph()
+        return
 
     begin()
     while not ready() and not failed():
