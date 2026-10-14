@@ -62,6 +62,8 @@ DELAY_SEC = 1.0           # сколько длится съёмка
 MIN_BYTE = 1              # нижняя граница яркости, см. комментарий в shoot()
 WAIT_REPORT_SEC = 2.0     # как часто сообщать, что всё ещё ждём предмет
 
+KERNEL_SIZE = 3
+
 # Упакованное изображение: numpy uint16, по два байта в регистре.
 _packed = None
 _height = 0
@@ -157,6 +159,7 @@ def shoot(img=None):
     # бесконечности перезапрашивает такой кусок. У настоящей камеры шум
     # матрицы не даёт чистого нуля: её самый тёмный байт равен 1.
     img = np.maximum(img, MIN_BYTE)
+    img = cv2.medianBlur(img, KERNEL_SIZE)
 
     flat = img.reshape(-1)                       # uint8: R,G,B,R,G,B,...
     if flat.size % 2:                            # на всякий случай
