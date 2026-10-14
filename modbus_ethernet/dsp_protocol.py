@@ -279,6 +279,7 @@ def handle(data: bytes):
 
 def main():
     load_valves()          # если есть сохранённая конфигурация - поднимаем её
+    capture.prepare()      # камера поднимается в фоне, до первого запроса
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)

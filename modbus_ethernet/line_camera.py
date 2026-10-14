@@ -424,40 +424,67 @@ class LineCamera:
 
 _camera = None
 _start_error = None
+_thread = None
 
 
-def ensure_started():
-    """Поднимает камеру при первом обращении. False, если не удалось."""
+def _startup():
+    """Открытие камеры и сбор фона. Занимает секунды, поэтому в потоке."""
     global _camera, _start_error
-    if _camera is not None:
-        return True
-    if _start_error is not None:
-        return False
     try:
         cam = LineCamera()
         cam.start()
         _camera = cam
-        return True
     except CameraError as e:
         _start_error = str(e)
         print(f"  камера недоступна: {e}")
-        return False
+    except Exception as e:                   # неожиданность не должна ронять
+        _start_error = repr(e)               # сервер вместе с собой
+        print(f"  камера не запустилась: {e!r}")
+
+
+def begin():
+    """
+    Запускает камеру в фоне и сразу возвращается.
+
+    Запускать нужно при старте программы, а не из обработчика запроса:
+    открытие камеры и сбор фона занимают секунды, и если делать это внутри
+    обработчика, сервер на всё это время перестаёт отвечать приложению.
+    """
+    global _thread
+    if _thread is not None:
+        return
+    _thread = threading.Thread(target=_startup, daemon=True)
+    _thread.start()
+
+
+def ready() -> bool:
+    """Камера поднялась и снимает."""
+    return _camera is not None
+
+
+def failed() -> bool:
+    """Камера не поднялась и больше не поднимется."""
+    return _start_error is not None
 
 
 def arm():
-    if ensure_started():
+    """Ждём следующий объект. Пока камера не готова - ничего не делает."""
+    if _camera is not None:
         _camera.arm()
 
 
 def take():
-    if not ensure_started():
+    """Кадр с объектом или None."""
+    if _camera is None:
         return None
     return _camera.take()
 
 
 def status():
     if _camera is None:
-        return _start_error or "не запущена"
+        if _start_error:
+            return _start_error
+        return "запускается" if _thread is not None else "не запущена"
     return _camera.status()
 
 
@@ -563,7 +590,10 @@ def main():
     if "--selftest" in sys.argv:
         raise SystemExit(0 if selftest() else 1)
 
-    if not ensure_started():
+    begin()
+    while not ready() and not failed():
+        time.sleep(0.1)
+    if failed():
         raise SystemExit(1)
     print("жду предметы, Ctrl+C для выхода")
     arm()

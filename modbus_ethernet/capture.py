@@ -40,8 +40,7 @@ from valve_config import HERE, REGISTERS
 MODE_FILE = 1            # картинка с диска
 MODE_LINE_CAMERA = 2     # кадр с линейной камеры
 
-MODE = MODE_LINE_CAMERA
-
+MODE = MODE_FILE
 
 # Если камера не поднялась, подставлять картинку с диска, чтобы приложение
 # не зависло в ожидании высоты. False - честно ждать камеру.
@@ -79,12 +78,26 @@ def _frame_from_file():
 _fallback_warned = False
 
 
+def prepare():
+    """
+    Вызывается при старте сервера, до начала обслуживания запросов.
+
+    Камера поднимается в фоне: её открытие и сбор фона занимают секунды,
+    и делать это из обработчика запроса нельзя - сервер на всё это время
+    перестанет отвечать приложению.
+    """
+    if MODE == MODE_LINE_CAMERA:
+        import line_camera
+        print("запускаю линейную камеру в фоне")
+        line_camera.begin()
+
+
 def _frame_from_camera():
     """Снятый объект с камеры, BGR. None, если предмет ещё не проехал."""
     global _fallback_warned
     import line_camera
 
-    if not line_camera.ensure_started():
+    if line_camera.failed():
         if not FALLBACK_TO_FILE:
             return None
         if not _fallback_warned:
@@ -92,6 +105,8 @@ def _frame_from_camera():
             _fallback_warned = True
         return _frame_from_file()
 
+    # Пока камера поднимается, кадра просто нет - приложение подождёт,
+    # получая метку. Блокировать сервер здесь нельзя.
     return line_camera.take()
 
 
@@ -149,7 +164,8 @@ def on_write(start, values):
             if MODE == MODE_LINE_CAMERA:
                 import line_camera
                 line_camera.arm()       # годится только предмет, снятый после
-                print("  съёмка начата, жду предмет")
+                print(f"  съёмка начата, жду предмет "
+                      f"(камера: {line_camera.status()})")
             else:
                 print(f"  съёмка начата, готовность через {DELAY_SEC} с")
 
