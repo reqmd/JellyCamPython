@@ -40,7 +40,8 @@ from valve_config import HERE, REGISTERS
 MODE_FILE = 1            # картинка с диска
 MODE_LINE_CAMERA = 2     # кадр с линейной камеры
 
-MODE = MODE_FILE
+MODE = MODE_LINE_CAMERA
+
 
 # Если камера не поднялась, подставлять картинку с диска, чтобы приложение
 # не зависло в ожидании высоты. False - честно ждать камеру.

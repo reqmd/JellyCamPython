@@ -20,4 +20,4 @@ check3_fuse_ops.onnx
 modbus_ethernet/__pycache__
 modbus_ethernet/valves.json
 modbus_ethernet/config.json
-
+modbus_ethernet/background.npy
