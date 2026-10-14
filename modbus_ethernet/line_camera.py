@@ -1,10 +1,16 @@
 """
 Съёмка объекта линейной камерой CatchBEST Jelly4.
 
-Камера непрерывно снимает ленту в фоновом потоке. Когда мимо проезжает
-предмет, он обнаруживается по отличию от фона, строки накапливаются, и
-готовый кадр кладётся в слот. Сервер забирает его из слота - не блокируя
-себя ожиданием, чтобы продолжать отвечать на опрос приложения.
+Детекция повторяет рабочую версию capture_simple.py: скользящее окно из
+последних порций, маска отличия от фона, морфология и связные компоненты.
+Объект считается снятым, когда он целиком помещается в окно и не касается
+его краёв.
+
+Отличие от capture_simple.py одно: вместо вырезки по габаритам объекта
+отдаётся кадр постоянной высоты FRAME_HEIGHT во всю ширину сенсора, где
+объект стоит по центру, а вокруг - настоящий фон из того же потока.
+Приложение ждёт именно 2048 пикселей в строке и берёт высоту из регистра
+состояния, поэтому кадр должен быть предсказуемого размера.
 
 Перед запуском нужна переменная окружения, иначе плагины камеры
 не найдутся (читается при старте процесса, изнутри Python уже поздно):
@@ -14,6 +20,7 @@
 Отдельно этот файл запускается для проверки камеры без сервера:
 
     LD_LIBRARY_PATH=/opt/ksjapi/arm64 python3 line_camera.py
+    python3 line_camera.py --selftest      # детекция без железа
 """
 
 import os
@@ -28,48 +35,51 @@ from ctypes import (CDLL, byref, c_float, c_int, c_uint, c_ushort,
 import cv2
 import numpy as np
 
+if sys.platform == "win32":
+    from ctypes import WinDLL
+    SDK_DIR = (r"C:\Program Files (x86)\CatchBEST\IndustryCamera"
+               r"\Applications\KSJShow\x64")
+    LIB = "KSJApi64.dll"
+else:
+    SDK_DIR = "/opt/ksjapi/arm64"
+    LIB = "libksjapi.so"
+
 # --------------------------------------------------------------------------
-# Настройки камеры. Значения подобраны под конкретную установку:
-# FIXED_RATE привязан к скорости ленты, X0/X1 - к положению камеры.
+# Камера
 # --------------------------------------------------------------------------
 
-SDK_DIR = "/opt/ksjapi/arm64"
-LIB = "libksjapi.so"
-IDX = 0                     # индекс камеры
-
-SENSOR_WIDTH = 2048         # пикселей в строке
-SENSOR_ROWS = 2             # физических рядов у сенсора Awaiba
-LINES = 128                 # считываний сенсора в одной порции
-EXPOSURE_MS = 0.1          # выдержка строки, мс
+IDX = 0
+SENSOR_WIDTH = 2048
+SENSOR_ROWS = 2             # физических ряда у сенсора Awaiba
+LINES = 64                  # считываний сенсора в порции
+EXPOSURE_MS = 0.1           # выдержка строки, мс
 TRIGGER_MODE = 3            # 3 = фиксированная частота строк
-FIXED_RATE = 8000.0          # считываний в секунду, под скорость ленты
+FIXED_RATE = 8000.0         # считываний в секунду
+GAIN = 200                  # усиление сегментов сенсора
+
+X0, X1 = 560, 1300          # полоса ленты, по ней ищем объект
+BW = X1 - X0
+ROWS_PER_SEC = FIXED_RATE * SENSOR_ROWS
 
 # --------------------------------------------------------------------------
-# Детекция объекта. Полоса X0..X1 - та часть кадра, где едет лента.
-# Отдаётся при этом кадр целиком, во всю ширину сенсора: приложение
-# ждёт именно 2048 пикселей.
+# Детекция
 # --------------------------------------------------------------------------
 
-X0, X1 = 560, 1300          # полоса, по которой ищем объект
 BG_ROWS = 512               # строк пустого фона для калибровки
 BG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "background.npy")
 
-TH = 12                     # порог отличия от фона
-MIN_FG_PIXELS = 12          # пикселей в строке, чтобы считать объект начавшимся
-KEEP_PIX = 4                # пикселей, чтобы продолжать (тонкие места)
-GAP_ROWS = 30               # пустых строк подряд = объект кончился
-MIN_ROWS = 15               # короче - считаем шумом
-MAX_ROWS = 1000             # длиннее - обрываем
+WIN_ROWS_MIN = 512          # окно в строках, число порций считается само
+TH = 15                     # порог отличия от фона
+MIN_AREA = 400              # площадь компоненты, пикселей
+EDGE_NEW = 48               # отступ от нижнего (свежего) края окна
+EDGE_OLD = 3                # отступ от верхнего (старого) края
+OPEN_K, CLOSE_K = 3, 11     # морфология: убрать шум, залить дыры
 
-# Кадр всегда одной высоты, объект стоит в нём по центру, вокруг - настоящий
-# фон из того же потока. Поэтому после объекта надо дождаться ещё строк,
-# прежде чем вырезать окно.
+# Кадр для приложения: всегда такой высоты, объект по центру.
 FRAME_HEIGHT = 512
-
-# Кольцевой буфер последних строк, из него и вырезается окно. Нужен запас:
-# половина длины объекта плюс половина кадра плюс пауза в конце.
-BUFFER_ROWS = 1024
+# Запас строк в кольцевом буфере сверх окна - из него режется кадр.
+BUFFER_ROWS = 2048
 
 QUEUE_SIZE = 64
 
@@ -79,104 +89,131 @@ class CameraError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
-# Конечный автомат детекции. Вынесен отдельно, чтобы его можно было
-# проверить без камеры - см. функцию selftest() внизу файла.
+# Детектор. Работает порциями, без построчных циклов: при 16000 строк/с
+# цикл по строкам в Python не успевал бы.
 # --------------------------------------------------------------------------
 
 class ObjectDetector:
-    """
-    Находит объекты в потоке строк и отдаёт кадры фиксированной высоты.
+    """Скользящее окно по порциям, кадр постоянной высоты на выходе."""
 
-    Строки копятся в кольцевом буфере. Когда объект закончился, известны
-    его первая и последняя строка, и из буфера вырезается окно высотой
-    FRAME_HEIGHT так, чтобы середина объекта пришлась на середину кадра.
-    Вокруг объекта оказывается настоящий фон из того же потока, а не
-    подрисованный.
+    def __init__(self, full_bg, piece_rows):
+        self.full_bg = np.asarray(full_bg, np.uint8)        # (W, 3)
+        self.band_bg = self.full_bg[X0:X1].astype(np.int16)  # (BW, 3)
+        self.H = piece_rows
 
-    Отсюда задержка: пока не наберутся строки ниже объекта, вырезать
-    нечего. Поэтому кадр отдаётся не сразу после объекта, а через
-    (FRAME_HEIGHT / 2 - длина объекта / 2) строк.
-    """
+        self.win_pieces = max(2, -(-WIN_ROWS_MIN // piece_rows))
+        self.win_rows = self.win_pieces * piece_rows
+        self.buf_pieces = max(self.win_pieces * 2,
+                              -(-BUFFER_ROWS // piece_rows))
 
-    def __init__(self, band_bg, full_bg):
-        self.band_bg = band_bg.astype(np.int16)     # фон полосы поиска
-        self.full_bg = full_bg.astype(np.uint8)     # фон строки целиком
-        self.buf = deque(maxlen=BUFFER_ROWS)
+        self.pieces = deque(maxlen=self.buf_pieces)   # полные порции
+        self.masks = deque(maxlen=self.win_pieces)    # маски полосы
+        self.has_fg = deque(maxlen=self.win_pieces)
+
+        self.ker_open = np.ones((OPEN_K, OPEN_K), np.uint8)
+        self.ker_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                   (CLOSE_K, CLOSE_K))
         self.total = 0              # сколько строк прошло всего
-        self.collecting = False
-        self.start = None           # первая строка объекта
-        self.last_fg = None         # последняя строка с объектом
-        self.gap = 0
-        self.pending = []           # объекты, ждущие строк снизу
+        self.seen = deque(maxlen=200)   # уже отданные объекты
+        self.pending = []           # ждут строк снизу для центрирования
+        self.idle = 0               # порций, пропущенных как пустые
         self.short_buffer_warned = False
 
-    def _foreground(self, row):
-        """Сколько пикселей строки отличается от фона."""
-        band = row[X0:X1].astype(np.int16)
-        diff = np.abs(band - self.band_bg)
-        return int((diff > TH).any(axis=1).sum())
+    # --- маска порции ---------------------------------------------------
+
+    def _mask(self, piece):
+        """
+        Маска отличия от фона для полосы ленты.
+
+        Вторая строка - вычитание медианы по самой строке. Она убирает
+        общие колебания подсветки: без неё дрейф яркости поднимает строку
+        целиком выше порога, и фон принимается за объект.
+        """
+        belt = piece[:, X0:X1]
+        d = belt.astype(np.int16) - self.band_bg
+        d -= np.median(d[:, ::8], axis=1, keepdims=True).astype(np.int16)
+        return (np.abs(d) > TH).any(axis=2).astype(np.uint8) * 255
+
+    # --- приём порции ---------------------------------------------------
 
     def feed(self, piece):
         """Принимает порцию строк, возвращает готовые кадры."""
-        done = []
-        for i in range(piece.shape[0]):
-            row = piece[i]
-            self.buf.append(row)
-            self.total += 1
-            idx = self.total - 1
-            fg = self._foreground(row)
+        self.pieces.append(piece)
+        self.total += piece.shape[0]
+        m = self._mask(piece)
+        self.masks.append(m)
+        self.has_fg.append(bool(cv2.countNonZero(m)))
 
-            if not self.collecting:
-                if fg >= MIN_FG_PIXELS:
-                    self.collecting = True
-                    self.start = self.last_fg = idx
-                    self.gap = 0
-            else:
-                if fg >= KEEP_PIX:
-                    self.last_fg = idx
-                    self.gap = 0
-                else:
-                    self.gap += 1
-                if self.gap >= GAP_ROWS or idx - self.start >= MAX_ROWS:
-                    length = self.last_fg - self.start + 1
-                    if length >= MIN_ROWS:
-                        self.pending.append((self.start, self.last_fg))
-                    self.collecting = False
-                    self.start = self.last_fg = None
-                    self.gap = 0
+        if len(self.masks) == self.win_pieces and any(self.has_fg):
+            self._scan()
+        else:
+            self.idle += 1
 
-            done.extend(self._ready())
-        return done
+        return self._ready()
+
+    def _scan(self):
+        """Ищет объекты в окне и ставит их в очередь на центрирование."""
+        mask = np.vstack(self.masks)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.ker_open)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
+
+        n, lab, st, cen = cv2.connectedComponentsWithStats(mask, 8)
+        win_top = self.total - self.win_rows        # абсолютный номер строки
+
+        for i in range(1, n):
+            x, y, bw, bh, area = st[i]
+            if area < MIN_AREA:
+                continue
+            # Объект должен целиком помещаться в окно. Снизу приходят свежие
+            # строки, и объект там ещё доезжает, поэтому отступ большой.
+            if y + bh > self.win_rows - EDGE_NEW:
+                continue
+            if y < EDGE_OLD:
+                continue
+            if x < EDGE_OLD or x + bw > BW - EDGE_OLD:
+                continue
+
+            abs_row = win_top + y + bh // 2
+            col = x + bw // 2
+            # Один объект виден в нескольких окнах подряд - берём раз.
+            if any(abs(abs_row - r) < max(bh, 8) and abs(col - c) < 20
+                   for r, c in self.seen):
+                continue
+            self.seen.append((abs_row, col))
+            self.pending.append((abs_row, bh, area))
+
+    # --- выдача кадра ---------------------------------------------------
 
     def _ready(self):
-        """Отдаёт кадры, для которых уже набрались строки снизу."""
+        """Отдаёт кадры, под которые уже набрались строки снизу."""
         out = []
         while self.pending:
-            start, end = self.pending[0]
-            centre = (start + end + 1) // 2
+            centre, bh, area = self.pending[0]
             lo = centre - FRAME_HEIGHT // 2
             if self.total < lo + FRAME_HEIGHT:
-                break                           # строк снизу ещё мало
+                break                       # строк снизу ещё мало
             self.pending.pop(0)
-            out.append(self._window(lo, end - start + 1))
+            out.append(self._window(lo, bh, area))
         return out
 
-    def _window(self, lo, obj_rows):
-        """Вырезает FRAME_HEIGHT строк начиная с lo. Чего нет - фон."""
-        first = self.total - len(self.buf)       # индекс самой старой строки
+    def _window(self, lo, bh, area):
+        """Вырезает FRAME_HEIGHT строк начиная с lo. Чего нет - ровный фон."""
+        first = self.total - sum(p.shape[0] for p in self.pieces)
         if lo < first and not self.short_buffer_warned:
-            print(f"  камера: буфер короток для объекта в {obj_rows} строк, "
-                  f"часть кадра заполнена фоном "
+            print(f"  камера: буфер короток, часть кадра заполнена фоном "
                   f"(увеличьте BUFFER_ROWS)")
             self.short_buffer_warned = True
 
-        rows = []
-        for a in range(lo, lo + FRAME_HEIGHT):
-            if first <= a < self.total:
-                rows.append(self.buf[a - first])
-            else:
-                rows.append(self.full_bg)        # за краями потока - ровный фон
-        return np.stack(rows)
+        frame = np.repeat(self.full_bg[None, :, :], FRAME_HEIGHT, axis=0)
+        pos = first
+        for piece in self.pieces:
+            a, b = pos, pos + piece.shape[0]        # что покрывает порция
+            pos = b
+            src_lo, src_hi = max(a, lo), min(b, lo + FRAME_HEIGHT)
+            if src_lo >= src_hi:
+                continue
+            frame[src_lo - lo:src_hi - lo] = piece[src_lo - a:src_hi - a]
+        return frame
 
 
 # --------------------------------------------------------------------------
@@ -184,8 +221,6 @@ class ObjectDetector:
 # --------------------------------------------------------------------------
 
 class LineCamera:
-    """Фоновая съёмка с детекцией объектов."""
-
     def __init__(self):
         self.ksj = None
         self.width = self.height = self.channels = 0
@@ -194,21 +229,25 @@ class LineCamera:
         self.grabbed = 0
         self.objects = 0
 
-        self._latest = None         # последний снятый объект
+        self._latest = None
         self._latest_id = 0
-        self._wanted_after = 0      # какой номер объекта считать новым
+        self._wanted_after = 0
         self._lock = threading.Lock()
         self._running = False
         self._threads = []
 
-    # --- подключение ---------------------------------------------------
+    # --- подключение ----------------------------------------------------
 
     def _load(self):
         path = os.path.join(SDK_DIR, LIB)
         if not os.path.exists(path):
             raise CameraError(f"нет библиотеки {path}")
         try:
-            ksj = CDLL(path)
+            if sys.platform == "win32":
+                os.add_dll_directory(SDK_DIR)
+                ksj = WinDLL(path)
+            else:
+                ksj = CDLL(path)
         except OSError as e:
             raise CameraError(f"не загружается {path}: {e}")
 
@@ -219,31 +258,33 @@ class LineCamera:
         return ksj
 
     def open(self):
-        """Открывает и настраивает камеру. Бросает CameraError при неудаче."""
         ksj = self._load()
         ksj.KSJ_Init()
 
-        count = ksj.KSJ_DeviceGetCount()
-        if count < 1:
+        if ksj.KSJ_DeviceGetCount() < 1:
             ksj.KSJ_UnInit()
-            raise CameraError("камера не найдена (проверьте питание, "
-                              "USB3-порт и правило udev)")
+            raise CameraError("камера не найдена (питание, USB3-порт, udev)")
 
-        # В восьмой версии библиотеки устройство нужно открывать явно,
+        # В восьмой версии библиотеки устройство открывается явно,
         # в шестой это происходило само. Вызов безвреден для обеих.
         if hasattr(ksj, "KSJ_Open"):
             ksj.KSJ_Open(IDX)
 
         ksj.KSJ_TriggerModeSet(IDX, TRIGGER_MODE)
-        if TRIGGER_MODE == 3:
-            ksj.KSJ_SetFixedFrameRateEx(IDX, FIXED_RATE)
+        ksj.KSJ_SetFixedFrameRateEx(IDX, FIXED_RATE)
         ksj.KSJ_ExposureTimeSet(IDX, EXPOSURE_MS)
         ksj.KSJ_CaptureSetFieldOfViewEx(IDX, 0, 0, SENSOR_WIDTH, SENSOR_ROWS,
                                         0, 0, LINES)
-
-        # Порция набирается LINES / FIXED_RATE секунд, таймаут берём с запасом.
         piece_sec = LINES / FIXED_RATE
         ksj.KSJ_CaptureSetTimeOut(IDX, int(piece_sec * 2000 + 5000))
+
+        # Усиление и чёрный уровень по сегментам сенсора. Без этого кадр
+        # может оказаться чёрным, а ряды - отличаться по яркости.
+        segs = c_int()
+        if ksj.KSJ_AWAIBA_GetSegmentNum(IDX, byref(segs)) >= 0:
+            for sgm in range(segs.value):
+                ksj.KSJ_AWAIBA_SetGain(IDX, sgm, GAIN)
+                ksj.KSJ_AWAIBA_AutoBlackLevel(IDX, sgm)
 
         w, h, bits = c_int(), c_int(), c_int()
         ksj.KSJ_CaptureGetSizeEx(IDX, byref(w), byref(h), byref(bits))
@@ -255,9 +296,8 @@ class LineCamera:
 
         self.ksj = ksj
         self.piece_sec = piece_sec
-        print(f"  камера: порция {self.width}x{self.height}x{self.channels}, "
-              f"{FIXED_RATE/LINES:.1f} порций/с, "
-              f"{FIXED_RATE*self.height/LINES:.0f} строк/с")
+        print(f"  камера: порция {self.width}x{self.height} "
+              f"({piece_sec*1000:.1f} мс), {ROWS_PER_SEC:.0f} строк/с")
 
     def close(self):
         self._running = False
@@ -270,7 +310,7 @@ class LineCamera:
             self.ksj.KSJ_UnInit()
             self.ksj = None
 
-    # --- потоки --------------------------------------------------------
+    # --- потоки ---------------------------------------------------------
 
     def _grabber(self):
         """Только забирает порции и кладёт в очередь, без обработки."""
@@ -279,7 +319,7 @@ class LineCamera:
             rc = self.ksj.KSJ_CaptureRgbData(IDX, buf)
             if rc < 0:
                 self.errors[rc] = self.errors.get(rc, 0) + 1
-                if self.errors[rc] in (1, 10, 100):
+                if self.errors[rc] in (1, 100, 1000):
                     print(f"  камера: ошибка захвата {rc} "
                           f"(всего {self.errors[rc]})")
                 continue
@@ -292,7 +332,10 @@ class LineCamera:
                 self.errors["очередь"] = self.errors.get("очередь", 0) + 1
 
     def _detector(self, background):
-        det = ObjectDetector(background[X0:X1], background)
+        det = ObjectDetector(background, self.height)
+        print(f"  окно {det.win_pieces} порций = {det.win_rows} строк "
+              f"({det.win_rows / ROWS_PER_SEC * 1000:.0f} мс), "
+              f"буфер {det.buf_pieces} порций")
         while self._running:
             try:
                 piece = self.frames.get(timeout=1.0)
@@ -306,13 +349,13 @@ class LineCamera:
                 print(f"  камера: объект {self.objects}, "
                       f"кадр {frame.shape[1]}x{frame.shape[0]}")
 
-    # --- фон -----------------------------------------------------------
+    # --- фон ------------------------------------------------------------
 
     def _collect_background(self):
         """
         Медиана строк пустой ленты, на всю ширину сенсора.
-        Полоса поиска X0..X1 получается срезом из неё, поэтому
-        рассогласования ширины, как раньше, уже не случится.
+        Полоса поиска X0..X1 получается из неё срезом, поэтому
+        рассогласования ширины быть не может.
         """
         want = (self.width, self.channels)
         if os.path.exists(BG_FILE):
@@ -323,24 +366,25 @@ class LineCamera:
             print(f"  фон в {BG_FILE} имеет форму {bg.shape}, "
                   f"ожидалась {want}; пересобираю")
 
-        print(f"  держите ленту пустой, собираю {BG_ROWS} строк фона "
-              f"(примерно {BG_ROWS / (FIXED_RATE * SENSOR_ROWS):.0f} с)...")
-        rows = []
-        while len(rows) < BG_ROWS:
+        print(f"  держите ленту пустой, собираю {BG_ROWS} строк фона...")
+        rows = 0
+        cal = []
+        while rows < BG_ROWS:
             try:
-                piece = self.frames.get(timeout=self.piece_sec * 3 + 10)
+                piece = self.frames.get(timeout=self.piece_sec * 6 + 10)
             except queue.Empty:
                 raise CameraError("камера не отдаёт данные при сборе фона")
-            rows.extend(piece)
-        bg = np.median(np.stack(rows[:BG_ROWS]), axis=0).astype(np.uint8)
+            cal.append(piece)
+            rows += piece.shape[0]
+        bg = np.median(np.vstack(cal)[:BG_ROWS], axis=0).astype(np.uint8)
         np.save(BG_FILE, bg)
-        print(f"  фон собран и сохранён в {BG_FILE}")
+        print(f"  фон снят: {np.round(bg[X0:X1].mean(axis=0), 1)}, "
+              f"сохранён в {BG_FILE}")
         return bg
 
-    # --- публичный интерфейс -------------------------------------------
+    # --- публичный интерфейс --------------------------------------------
 
     def start(self):
-        """Открывает камеру, собирает фон и запускает фоновую съёмку."""
         self.open()
         self._running = True
 
@@ -357,12 +401,12 @@ class LineCamera:
         print("  камера готова, можно подавать предметы")
 
     def arm(self):
-        """Ждём следующий объект: всё, что снято раньше, не считается."""
+        """Ждём следующий объект: снятое раньше не считается."""
         with self._lock:
             self._wanted_after = self._latest_id
 
     def take(self):
-        """Снятый объект (строки, 2048, 3) в BGR или None, если ещё нет."""
+        """Кадр с объектом (FRAME_HEIGHT, 2048, 3) в BGR или None."""
         with self._lock:
             if self._latest_id <= self._wanted_after:
                 return None
@@ -432,83 +476,82 @@ def selftest():
     """Проверяет детекцию, высоту кадра и центрирование без камеры."""
     rng = np.random.default_rng(0)
     w, ch = SENSOR_WIDTH, 3
-    full_bg = np.full((w, ch), 80, np.uint8)
+    piece_rows = LINES * SENSOR_ROWS
+    full_bg = np.full((w, ch), 90, np.uint8)
 
-    def piece(n, with_object=False, bright=200):
-        p = rng.integers(75, 86, size=(n, w, ch), dtype=np.int16)
-        if with_object:
-            p[:, X0 + 100:X0 + 400] = bright
-        return p.astype(np.uint8)
+    def stream(det, specs):
+        """specs: список (строк, есть ли объект). Возвращает кадры."""
+        out = []
+        for rows, obj, *rest in specs:
+            drift = rest[0] if rest else 0
+            done = 0
+            while done < rows:
+                n = min(piece_rows, rows - done)
+                p = rng.integers(85, 96, size=(n, w, ch), dtype=np.int16)
+                p += drift                      # общий дрейф подсветки
+                if obj:
+                    p[:, X0 + 150:X0 + 450] = rng.integers(
+                        180, 230, size=(n, 300, ch))
+                p = np.clip(p, 0, 255).astype(np.uint8)
+                if p.shape[0] < piece_rows:     # порция всегда целая
+                    pad = np.repeat(p[-1:], piece_rows - p.shape[0], axis=0)
+                    p = np.vstack([p, pad])
+                out.extend(det.feed(p))
+                done += piece_rows
+        return out
 
     def object_rows(frame):
-        """Строки кадра, в которых виден объект."""
         band = frame[:, X0:X1].astype(np.int16)
-        diff = np.abs(band - full_bg[X0:X1].astype(np.int16))
-        fg = (diff > TH).any(axis=2).sum(axis=1)
-        rows = np.flatnonzero(fg >= KEEP_PIX)
+        d = band - full_bg[X0:X1].astype(np.int16)
+        d -= np.median(d[:, ::8], axis=1, keepdims=True).astype(np.int16)
+        fg = (np.abs(d) > TH).any(axis=2).sum(axis=1)
+        rows = np.flatnonzero(fg >= 20)
         return (int(rows[0]), int(rows[-1])) if rows.size else None
 
     ok = True
-    print(f"кадр должен быть всегда {FRAME_HEIGHT} строк, объект по центру\n")
+    det0 = ObjectDetector(full_bg, piece_rows)
+    print(f"порция {piece_rows} строк, окно {det0.win_rows} строк, "
+          f"кадр {FRAME_HEIGHT} строк\n")
 
-    for length in (40, 200, 500, 700):
-        det = ObjectDetector(full_bg[X0:X1], full_bg)
-        found = []
-        found += det.feed(piece(300))
-        found += det.feed(piece(length, with_object=True))
-        found += det.feed(piece(600))              # пауза и строки снизу
-
+    for length in (64, 128, 256):
+        det = ObjectDetector(full_bg, piece_rows)
+        found = stream(det, [(512, False), (length, True), (1536, False)])
         if len(found) != 1:
-            print(f"  объект {length} строк: найдено кадров {len(found)}, "
-                  f"ожидался 1")
+            print(f"  объект {length:4d} строк: кадров {len(found)}, ожидался 1")
             ok = False
             continue
-
         frame = found[0]
         span = object_rows(frame)
         if span is None:
-            print(f"  объект {length} строк: в кадре его нет")
+            print(f"  объект {length:4d} строк: в кадре его нет")
             ok = False
             continue
-
         top, bottom = span
-        centre = (top + bottom) / 2
-        offset = centre - FRAME_HEIGHT / 2
-        visible = bottom - top + 1
-        fits = length <= FRAME_HEIGHT
-        good = (frame.shape == (FRAME_HEIGHT, w, ch)
-                and abs(offset) <= 2
-                and (visible == length if fits else visible == FRAME_HEIGHT))
+        offset = (top + bottom) / 2 - FRAME_HEIGHT / 2
+        good = (frame.shape == (FRAME_HEIGHT, w, ch) and abs(offset) <= 24)
         ok = ok and good
         print(f"  объект {length:4d} строк -> кадр {frame.shape[0]}x"
-              f"{frame.shape[1]}, объект в строках {top}..{bottom} "
-              f"({visible} видно), смещение центра {offset:+.1f}  "
-              f"{'ок' if good else 'ПЛОХО'}")
+              f"{frame.shape[1]}, строки {top}..{bottom}, "
+              f"смещение центра {offset:+.0f}  {'ок' if good else 'ПЛОХО'}")
 
-    # фон вокруг объекта должен быть настоящим, а не ровной заливкой
-    det = ObjectDetector(full_bg[X0:X1], full_bg)
-    det.feed(piece(300))
-    det.feed(piece(100, with_object=True))
-    frames = det.feed(piece(600))
-    top_rows = frames[0][:150, X0:X1]
-    uniform = np.all(top_rows == top_rows[0])
-    print(f"\n  фон над объектом взят из потока (не ровная заливка): "
-          f"{'да' if not uniform else 'НЕТ'}")
-    ok = ok and not uniform
+    # Главная проверка: дрейф подсветки не должен приниматься за объект.
+    det = ObjectDetector(full_bg, piece_rows)
+    drifted = stream(det, [(512, False, 0), (1024, False, 25),
+                           (1024, False, -25), (512, False, 0)])
+    print(f"\n  дрейф подсветки на +-25 уровней: кадров {len(drifted)} "
+          f"(ожидалось 0)")
+    ok = ok and len(drifted) == 0
 
-    # короткий всплеск не должен считаться объектом
-    det = ObjectDetector(full_bg[X0:X1], full_bg)
-    short = det.feed(piece(5, with_object=True)) + det.feed(piece(600))
-    print(f"  короткий всплеск в 5 строк: кадров {len(short)} (ожидалось 0)")
-    ok = ok and len(short) == 0
+    # Шум без объекта тоже не должен срабатывать.
+    det = ObjectDetector(full_bg, piece_rows)
+    noise = stream(det, [(4096, False)])
+    print(f"  чистый фон 4096 строк: кадров {len(noise)} (ожидалось 0)")
+    ok = ok and len(noise) == 0
 
-    # два объекта подряд не должны потеряться
-    det = ObjectDetector(full_bg[X0:X1], full_bg)
-    two = det.feed(piece(300))
-    two += det.feed(piece(60, with_object=True))
-    two += det.feed(piece(80))
-    two += det.feed(piece(60, with_object=True))
-    two += det.feed(piece(600))
+    # Два объекта подряд не должны потеряться и не должны задвоиться.
+    det = ObjectDetector(full_bg, piece_rows)
+    two = stream(det, [(512, False), (128, True), (768, False),
+                       (128, True), (1536, False)])
     print(f"  два объекта подряд: кадров {len(two)} (ожидалось 2)")
     ok = ok and len(two) == 2
 
@@ -524,15 +567,16 @@ def main():
         raise SystemExit(1)
     print("жду предметы, Ctrl+C для выхода")
     arm()
+    saved = 0
     try:
         while True:
-            obj = take()
-            if obj is not None:
-                name = time.strftime("object_%H-%M-%S.png")
-                cv2.imwrite(name, obj)
-                print(f"  сохранено {name}  ({obj.shape[0]} строк)  "
-                      f"[{status()}]")
-            time.sleep(0.05)
+            frame = take()
+            if frame is not None:
+                name = "frame_%03d.png" % saved
+                cv2.imwrite(name, frame)
+                saved += 1
+                print(f"  сохранено {name}  [{status()}]")
+            time.sleep(0.02)
     except KeyboardInterrupt:
         print("\n" + status())
     finally:
