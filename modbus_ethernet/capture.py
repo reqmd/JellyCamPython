@@ -159,7 +159,6 @@ def shoot(img=None):
     # бесконечности перезапрашивает такой кусок. У настоящей камеры шум
     # матрицы не даёт чистого нуля: её самый тёмный байт равен 1.
     img = np.maximum(img, MIN_BYTE)
-    img = cv2.medianBlur(img, KERNEL_SIZE)
 
     flat = img.reshape(-1)                       # uint8: R,G,B,R,G,B,...
     if flat.size % 2:                            # на всякий случай
