@@ -9,6 +9,7 @@
 """
 
 import math
+import os
 import random
 import errno
 import socket
@@ -299,6 +300,41 @@ def handle(data: bytes):
     return []
 
 
+def open_socket():
+    """
+    UDP-сокет сервера.
+
+    Если сервер запущен systemd по первому пришедшему пакету (dsp.socket),
+    сокет уже открыт и лежит в дескрипторе 3 - берём его, пакет, который
+    разбудил сервер, в нём и ждёт. Иначе открываем сами.
+
+    При загрузке системы сервер может стартовать раньше, чем сетевой карте
+    назначен адрес 192.168.2.101, и bind упадёт. Тогда ждём и повторяем,
+    а не завершаемся.
+    """
+    if (os.environ.get("LISTEN_PID") == str(os.getpid())
+            and int(os.environ.get("LISTEN_FDS", "0")) >= 1):
+        sock = socket.socket(fileno=3)
+        print(f"сокет получен от systemd: {sock.getsockname()}")
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        waited = 0
+        while True:
+            try:
+                sock.bind((IP_ADDRESS, PORT))
+                break
+            except OSError as e:
+                if e.errno != errno.EADDRNOTAVAIL:
+                    raise
+                if waited % 30 == 0:
+                    print(f"адреса {IP_ADDRESS} пока нет на сетевой карте, "
+                          f"жду ({waited} с)")
+                time.sleep(1)
+                waited += 1
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
+    return sock
+
+
 def main():
     import logger
     logger.start()          # всё напечатанное - ещё и в logs/<дата>.log
@@ -306,10 +342,9 @@ def main():
     load_valves()          # если есть сохранённая конфигурация - поднимаем её
     capture.prepare()      # камера поднимается в фоне, до первого запроса
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
-    sock.bind((IP_ADDRESS, PORT))
-    print(f"слушаю {IP_ADDRESS}:{PORT}, адрес устройства {UNIT}")
+    sock = open_socket()
+    host, port = sock.getsockname()[:2]
+    print(f"слушаю {host}:{port}, адрес устройства {UNIT}")
     print(f"тип камеры {CAMERA_TYPE}, "
           f"поле зрения {REGISTERS[FOV_LEFT_REG]}..{REGISTERS[FOV_RIGHT_REG]}, "
           f"клапанов {REGISTERS[VALVE_COUNT_REG]}")
