@@ -1,0 +1,22 @@
+#!/bin/sh
+# /etc/kernel/postinst.d/zz-spi-lowlat
+#
+# Автоматически восстанавливает оверлей низкой задержки CS
+# при установке нового ядра. Первым аргументом dpkg передаёт
+# версию устанавливаемого ядра.
+#
+# Установка:
+#   sudo cp zz-spi-lowlat /etc/kernel/postinst.d/
+#   sudo chmod +x /etc/kernel/postinst.d/zz-spi-lowlat
+
+set -e
+
+KVER="$1"
+[ -n "$KVER" ] || exit 0
+[ -x /usr/local/sbin/install-spi-lowlat.sh ] || exit 0
+
+/usr/local/sbin/install-spi-lowlat.sh "$KVER" || {
+	echo "zz-spi-lowlat: не удалось установить оверлей для ${KVER}" >&2
+	# не прерываем установку ядра
+	exit 0
+}

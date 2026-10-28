@@ -10,7 +10,9 @@
 
 import math
 import random
+import errno
 import socket
+import traceback
 import struct
 import time
 
@@ -298,6 +300,9 @@ def handle(data: bytes):
 
 
 def main():
+    import logger
+    logger.start()          # всё напечатанное - ещё и в logs/<дата>.log
+
     load_valves()          # если есть сохранённая конфигурация - поднимаем её
     capture.prepare()      # камера поднимается в фоне, до первого запроса
 
@@ -311,12 +316,42 @@ def main():
 
     while True:
         data, addr = sock.recvfrom(65535)
-        first = True
-        for frame in handle(data):
-            if FRAME_DELAY and not first:
-                time.sleep(FRAME_DELAY)
+        # Одна неудачная обработка не должна останавливать сервер. Раньше
+        # любое исключение - в разборе, в сборке ответа или в отправке -
+        # завершало программу, и сервер переставал отвечать совсем.
+        # Теперь ошибка печатается с трассировкой (и попадает в лог), а
+        # сервер ждёт следующий запрос.
+        try:
+            first = True
+            for frame in handle(data):
+                if FRAME_DELAY and not first:
+                    time.sleep(FRAME_DELAY)
+                send(sock, frame, addr)
+                first = False
+        except Exception:
+            print(f"ОШИБКА при обработке запроса от {addr[0]}:{addr[1]}, "
+                  f"{len(data)} байт: {data[:16].hex()}")
+            traceback.print_exc()
+
+
+def send(sock, frame, addr):
+    """
+    Отправка с повтором. При длинной очереди датаграмм - снимок это 2161
+    кадр подряд - Linux может ответить "нет места в буфере" (ENOBUFS).
+    Это временно: подождать и повторить, а не терять кадр и не падать.
+    """
+    for attempt in range(50):
+        try:
             sock.sendto(frame, addr)
-            first = False
+            return
+        except (BlockingIOError, InterruptedError):
+            time.sleep(0.001)
+        except OSError as e:
+            if e.errno in (errno.ENOBUFS, errno.EAGAIN):
+                time.sleep(0.001 * (attempt + 1))
+                continue
+            raise
+    print(f"кадр не ушёл после 50 попыток ({len(frame)} байт)")
 
 
 if __name__ == "__main__":
