@@ -23,3 +23,9 @@ modbus_ethernet/valves.json
 modbus_ethernet/config.json
 modbus_ethernet/background.npy
 /objects
+/calib
+/output
+dataset.txt
+/snapshot
+preview.png
+preview_npu.png
