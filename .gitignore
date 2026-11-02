@@ -29,3 +29,4 @@ dataset.txt
 /snapshot
 preview.png
 preview_npu.png
+modbus_ethernet/background_rows_flip.npy

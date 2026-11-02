@@ -18,6 +18,7 @@ import struct
 import time
 
 import capture
+import valves
 from valve_config import (
     REGISTERS,                    # общий словарь регистров, второго быть не должно
     VALVE_COUNT_REG, VALVE_BASE,
@@ -294,6 +295,8 @@ def handle(data: bytes):
 
         # Команды съёмки и служебные регистры.
         capture.on_write(start, values)
+        # Проверка механики: регистр 70 - номер клапана, открыть его по SPI.
+        valves.on_write(start, values)
 
         return [build_write_response(start, count)]
 
@@ -341,6 +344,7 @@ def main():
 
     load_valves()          # если есть сохранённая конфигурация - поднимаем её
     capture.prepare()      # камера поднимается в фоне, до первого запроса
+    valves.prepare()       # плата клапанов по SPI; без неё сервер работает
 
     sock = open_socket()
     host, port = sock.getsockname()[:2]

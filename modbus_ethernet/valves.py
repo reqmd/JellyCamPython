@@ -2,41 +2,87 @@
 """
 Управление платой клапанов через SPI (Orange Pi 5 Plus, /dev/spidev0.0).
 
-Формат кадра — 10 байт, CS удерживается низким на всю посылку:
+Формат кадра - 10 байт, CS удерживается низким на всю посылку:
 
     [Duration][Data7][Data6][Data5][Data4][Data3][Data2][Data1][Data0][0x99]
 
-    Duration  — длительность работы клапанов, 0..31
-    Data[7]   — клапаны 63..56   (старший байт идёт первым)
+    Duration  - длительность работы клапанов, 0..MAX_DURATION
+    Data[7]   - клапаны 63..56   (старший байт идёт первым)
     ...
-    Data[0]   — клапаны 7..0
-    0x99      — контрольный байт (153)
+    Data[0]   - клапаны 7..0
+    0x99      - контрольный байт (153)
 
-Клапаны нумеруются с нуля: 0..63.
+Клапаны на плате нумеруются с нуля: 0..63.
+
+Файл работает двумя способами.
+
+1. Из сервера (dsp_protocol.py) - проверка механики. Приложение пишет в
+   регистр 70 номер клапана, сервер открывает этот клапан на плате:
+
+       регистр 70 = N  ->  клапан N - VALVE_NUMBER_BASE на плате
+       регистр 70 = 0  ->  все клапаны закрыть
+
+   Если SPI недоступен (нет модуля spidev, нет прав на /dev/spidev0.0),
+   сервер продолжает работать как обычно, а в лог пишется причина.
+
+2. Из командной строки - тесты платы, как раньше:
+
+       python3 valves.py --valves 0,5,63
+       python3 valves.py --test edges
+       python3 valves.py --off
 """
 
-import sys
 import time
 
 try:
     import spidev
-except ImportError:
-    sys.exit("Нет модуля spidev. Установите: sudo apt install python3-spidev")
-
+except ImportError:            # без SPI сервер должен работать дальше
+    spidev = None
 
 BUS = 0
 DEVICE = 0
 SPEED = 20_000_000     # 20 МГц, рекомендованное значение (допустимо 1..35 МГц)
-MODE = 1               # CPOL=0, CPHA=1. Если не работает — попробуйте 3
+MODE = 1               # CPOL=0, CPHA=1. Если не работает - попробуйте 3
 CHECKSUM = 0x99        # 153
 FRAME_LEN = 10
-MAX_DURATION = 10
-VALVE_COUNT = 64
+# Длительность в кадре - 5 бит, 0..31 по формату платы. Если плата на
+# значениях больше 10 перестаёт реагировать, верните 10: такой предел
+# стоял в исходной версии файла.
+MAX_DURATION = 31
+VALVE_COUNT = 32
+
+# --------------------------------------------------------------------------
+# Проверка механики из приложения
+# --------------------------------------------------------------------------
+
+TEST_REG = 70          # регистр, в который приложение пишет номер клапана
+# С какого числа приложение считает клапаны. 1 - клапан "1" в приложении
+# это клапан 0 на плате (так обычно и нумерует интерфейс: 1..64). Если
+# при проверке срабатывает соседний клапан, поставьте 0.
+VALVE_NUMBER_BASE = 1
+# Сколько номеров приложения приходится на один клапан платы. Приложение
+# пишет номера подряд, 1..64, а клапанов (и светодиодов на ленте) 32: на
+# каждый клапан по два номера. Делитель 2 сводит 1..64 к клапанам 0..31 -
+# проверено на машине, лента пробегается целиком.
+VALVE_DIVISOR = 1
+# На сколько открывать клапан при проверке, 0..MAX_DURATION. Приложение
+# шлёт команды примерно раз в 125 мс, на клапан приходится две подряд.
+# Подобрать на глаз можно и без приложения:
+#     python3 valves.py --test single --duration 20 --pause 0.25
+TEST_DURATION = 20
+# Через сколько секунд снова пробовать открыть SPI, если не вышло.
+RETRY_SEC = 5.0
+
+INSTALL_HINT = ("модуль spidev не установлен в этот Python. Установите "
+                "именно в тот, которым запускается сервер: "
+                "python3 -m pip install spidev")
 
 
 class ValveBoard:
     def __init__(self, bus=BUS, device=DEVICE, speed=SPEED, mode=MODE,
                  verbose=False):
+        if spidev is None:
+            raise RuntimeError(INSTALL_HINT)
         self.verbose = verbose
         self.spi = spidev.SpiDev()
         self.spi.open(bus, device)
@@ -52,12 +98,13 @@ class ValveBoard:
     @staticmethod
     def build_frame(valves, duration):
         """
-        valves   — что открыть: набор номеров 0..63, либо целое 64-битное число
-        duration — 0..31
+        valves   - что открыть: набор номеров 0..63, либо целое 64-битное число
+        duration - 0..MAX_DURATION
         Возвращает список из 10 байт.
         """
         if not 0 <= duration <= MAX_DURATION:
-            raise ValueError(f"duration вне диапазона 0..{MAX_DURATION}: {duration}")
+            raise ValueError(f"duration вне диапазона 0..{MAX_DURATION}: "
+                             f"{duration}")
 
         if isinstance(valves, int):
             mask = valves
@@ -65,7 +112,7 @@ class ValveBoard:
             mask = 0
             for v in valves:
                 if not 0 <= v < VALVE_COUNT:
-                    raise ValueError(f"клапан вне диапазона 0..63: {v}")
+                    raise ValueError(f"клапан вне диапазона 0..31: {v}")
                 mask |= 1 << v
 
         if not 0 <= mask < (1 << VALVE_COUNT):
@@ -84,8 +131,11 @@ class ValveBoard:
         frame = self.build_frame(valves, duration)
         if self.verbose:
             print("TX: " + " ".join(f"{b:02X}" for b in frame))
-        # xfer2 держит CS низким на всю посылку и поднимает его после
-        self.spi.xfer2(frame)
+        # xfer2 держит CS низким на всю посылку и поднимает его после.
+        # Передаём копию: xfer2 записывает в переданный список принятые
+        # по MISO байты, и в логе вместо отправленного кадра оказывались
+        # одни FF.
+        self.spi.xfer2(list(frame))
         return frame
 
     def open_valves(self, valves, duration):
@@ -109,10 +159,130 @@ class ValveBoard:
         self.close()
 
 
+# --------------------------------------------------------------------------
+# Для сервера: одна плата на всю программу, открывается при первой команде
+# --------------------------------------------------------------------------
+
+_board = None
+_last_error = None
+_retry_at = 0.0
+
+
+def _get_board():
+    """
+    Плата или None. Ошибка открытия печатается один раз, повторно - только
+    если она сменилась, чтобы не засыпать лог одинаковыми строками.
+    Пробуем снова не чаще раза в RETRY_SEC: права на устройство могли
+    выдать, а модуль - доустановить, не перезапуская сервер.
+    """
+    global _board, _last_error, _retry_at
+    if _board is not None:
+        return _board
+    now = time.monotonic()
+    if now < _retry_at:
+        return None
+    try:
+        _board = ValveBoard()
+        print(f"клапаны: SPI открыт, /dev/spidev{BUS}.{DEVICE}, "
+              f"{_board.spi.max_speed_hz / 1e6:.0f} МГц, mode {MODE}")
+        _last_error = None
+        return _board
+    except Exception as e:
+        msg = str(e) or type(e).__name__
+        if msg != _last_error:
+            hint = ""
+            if isinstance(e, PermissionError):
+                hint = (" - у пользователя нет прав на устройство, "
+                        "см. группу spi или правило udev")
+            elif isinstance(e, FileNotFoundError):
+                hint = " - SPI не включён в системе (overlay в armbianEnv)"
+            print(f"клапаны: SPI недоступен: {msg}{hint}")
+            _last_error = msg
+        _retry_at = now + RETRY_SEC
+        return None
+
+
+def prepare():
+    """При старте сервера: открыть SPI и сказать, получилось ли."""
+    _get_board()
+
+
+def fire(valve, duration=TEST_DURATION):
+    """Открыть один клапан платы (0..63). True, если кадр ушёл."""
+    global _board
+    board = _get_board()
+    if board is None:
+        return False
+    try:
+        frame = board.open_valves([valve], duration)
+    except Exception as e:
+        # Устройство могло пропасть - закрываем, при следующей команде
+        # откроем заново.
+        print(f"клапаны: ошибка отправки по SPI: {e}")
+        try:
+            board.spi.close()
+        except Exception:
+            pass
+        _board = None
+        return False
+    print(f"клапаны: открыт клапан {valve} на {duration}, кадр "
+          + " ".join(f"{b:02X}" for b in frame))
+    return True
+
+
+def close_all():
+    """Закрыть все клапаны. True, если кадр ушёл."""
+    board = _get_board()
+    if board is None:
+        return False
+    try:
+        board.close_all()
+    except Exception as e:
+        print(f"клапаны: ошибка отправки по SPI: {e}")
+        return False
+    print("клапаны: все закрыты")
+    return True
+
+
+def on_write(start, values):
+    """
+    Запись из приложения. Реагируем только на регистр TEST_REG: его
+    значение - номер клапана, который надо открыть.
+    """
+    if not start <= TEST_REG < start + len(values):
+        return
+    number = values[TEST_REG - start]
+    if number == 0:
+        print(f"клапаны: регистр {TEST_REG} = 0, закрываю все")
+        close_all()
+        return
+    valve = (number - VALVE_NUMBER_BASE) // VALVE_DIVISOR
+    if not 0 <= valve < VALVE_COUNT:
+        print(f"клапаны: регистр {TEST_REG} = {number} - такого клапана нет "
+              f"на плате (выходит {valve}, а там 0..{VALVE_COUNT - 1}; "
+              f"VALVE_NUMBER_BASE = {VALVE_NUMBER_BASE}, VALVE_DIVISOR = "
+              f"{VALVE_DIVISOR}), пропускаю")
+        return
+    print(f"клапаны: регистр {TEST_REG} = {number} -> клапан {valve} "
+          f"на плате")
+    fire(valve)
+
+
+def shutdown():
+    """При остановке сервера: закрыть клапаны и устройство."""
+    global _board
+    if _board is not None:
+        try:
+            _board.close()
+        except Exception:
+            pass
+        _board = None
+
+
 # ------------------------------------------------------------------ сценарии
 
 def test_single(board, duration=2, pause=0.5):
-    """По очереди открыть каждый клапан — бегущая волна."""
+    """По очереди открыть каждый клапан - бегущая волна."""
     print(f"Прогон клапанов 0..63, duration={duration}")
     for v in range(VALVE_COUNT):
         print(f"  клапан {v}")
@@ -122,7 +292,7 @@ def test_single(board, duration=2, pause=0.5):
 
 
 def test_groups(board, duration=2, pause=1.0):
-    """Открывать группами по 8 — проверка порядка байт."""
+    """Открывать группами по 8 - проверка порядка байт."""
     print(f"Прогон группами по 8, duration={duration}")
     for g in range(8):
         valves = list(range(g * 8, g * 8 + 8))
@@ -135,7 +305,7 @@ def test_groups(board, duration=2, pause=1.0):
 def test_edges(board, duration=2, pause=1.0):
     """
     Крайние клапаны по одному. Если порядок байт перепутан,
-    клапан 0 и клапан 63 поменяются местами — это сразу видно.
+    клапан 0 и клапан 63 поменяются местами - это сразу видно.
     """
     for v in (0, 1, 62, 63):
         print(f"  клапан {v}")
@@ -150,7 +320,7 @@ def test_speeds(mode=MODE, duration=2, repeats=300, pause=0.02):
 
     Чем выше частота, тем короче кадр и тем уже яма на CS.
     Смотрите осциллографом ширину ямы и следите, с какой частоты
-    плата перестаёт реагировать — рабочей считайте предыдущую.
+    плата перестаёт реагировать - рабочей считайте предыдущую.
     """
     speeds = [1_000_000, 2_000_000, 5_000_000,
               10_000_000, 20_000_000, 35_000_000]
@@ -195,14 +365,22 @@ def test_burst(board, count=50, duration=2):
 
 def main():
     import argparse
+    import sys
+
+    if spidev is None:
+        sys.exit(INSTALL_HINT)
 
     p = argparse.ArgumentParser(description="Управление платой клапанов по SPI")
     p.add_argument("--mode", type=int, default=MODE, choices=[0, 1, 2, 3],
                    help=f"режим SPI (по умолчанию {MODE})")
     p.add_argument("--speed", type=int, default=SPEED,
                    help=f"частота SCK в Гц (по умолчанию {SPEED})")
-    p.add_argument("--duration", type=int, default=10,
-                   help="длительность 0..31 (по умолчанию 10)")
+    p.add_argument("--duration", type=int, default=MAX_DURATION,
+                   help=f"длительность 0..{MAX_DURATION} "
+                        f"(по умолчанию {MAX_DURATION})")
+    p.add_argument("--pause", type=float, default=0.5,
+                   help="пауза между клапанами в тестах single, секунд "
+                        "(приложение шлёт раз в ~0.125)")
     p.add_argument("--valves", type=str, default=None,
                    help="номера клапанов через запятую, например 0,5,63")
     p.add_argument("--test", choices=["single", "groups", "edges",
@@ -231,7 +409,7 @@ def main():
             return
 
         if args.test == "single":
-            test_single(board, args.duration)
+            test_single(board, args.duration, args.pause)
         elif args.test == "groups":
             test_groups(board, args.duration)
         elif args.test == "edges":
