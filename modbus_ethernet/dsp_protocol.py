@@ -65,6 +65,15 @@ MAX_READ_REGS = max(30000, capture.WIDTH * capture.MAX_HEIGHT
 # 0 - слать без пауз. Если видны потери, начните с 0.0002.
 FRAME_DELAY = 0.0
 
+# Чтения, которые не печатаются: регистр 99 - статус, приложение спрашивает
+# его несколько раз в секунду, и лог разрастался в основном из-за него.
+# Вместо каждой строки раз в QUIET_SUMMARY_SEC печатается одна сводка -
+# по ней видно, что приложение на связи. Пустое множество - печатать всё.
+QUIET_READ_REGS = {99}
+QUIET_SUMMARY_SEC = 60
+_quiet_count = 0
+_quiet_since = time.monotonic()
+
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
 # Регистры идут так:
@@ -249,6 +258,19 @@ def build_write_response(start: int, count: int) -> bytes:
 # Обработка запроса
 # --------------------------------------------------------------------------
 
+def quiet_read():
+    """Учесть тихое чтение; раз в QUIET_SUMMARY_SEC напечатать сводку."""
+    global _quiet_count, _quiet_since
+    _quiet_count += 1
+    now = time.monotonic()
+    if now - _quiet_since >= QUIET_SUMMARY_SEC:
+        regs = ", ".join(str(r) for r in sorted(QUIET_READ_REGS))
+        print(f"статус: регистр {regs} запрошен {_quiet_count} раз "
+              f"за {now - _quiet_since:.0f} с")
+        _quiet_count = 0
+        _quiet_since = now
+
+
 def handle(data: bytes):
     """
     Возвращает кадры ответа: список для записи, генератор для чтения.
@@ -268,6 +290,9 @@ def handle(data: bytes):
             print(f"чтение: регистр {start}, количество {count} -- "
                   f"вне допустимого (1..{MAX_READ_REGS}), игнорирую")
             return []
+        if count == 1 and start in QUIET_READ_REGS:
+            quiet_read()
+            return iter_read_frames(start, count)
         per = MAX_REGS_PER_FRAME or count
         parts = -(-count // per)          # округление вверх
         print(f"чтение: регистр {start}, количество {count}"
