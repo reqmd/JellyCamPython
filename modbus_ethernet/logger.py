@@ -14,8 +14,14 @@
 
     import logger; logger.start()
 
-Файлы лежат в папке logs рядом с этим файлом, по одному на день:
-logs/2026-10-20.log. Запись дописывается, старые файлы не трогаются.
+Файлы лежат в папке logs рядом с этим файлом, у каждого запуска свой:
+logs/2026-11-04_09-14-55.log - дата и время старта. Перезапуск, в том
+числе автоматический после падения, начинает новый файл, прежние не
+трогаются. Если программа работает через полночь, в 00:00 тоже
+начинается новый файл - чтобы файлы оставались по дням.
+
+Файлы старше LOG_KEEP_DAYS дней удаляются при запуске, чтобы папка не
+росла бесконечно. 0 - не удалять ничего.
 """
 
 import atexit
@@ -25,24 +31,52 @@ import threading
 import time
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_KEEP_DAYS = 30
 
 _lock = threading.Lock()
 _file = None
 _day = None
 
 
+def _new_name():
+    """Имя файла по текущему времени: 2026-11-04_09-14-55.log."""
+    name = time.strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(LOG_DIR, name + ".log")
+    n = 1
+    while os.path.exists(path):         # два запуска в одну секунду
+        n += 1
+        path = os.path.join(LOG_DIR, f"{name}_{n}.log")
+    return path
+
+
 def _open_for_today():
-    """Файл текущего дня; в полночь переключается на новый."""
+    """
+    Файл текущего запуска. Открывается при первой записи; в полночь
+    вместо него начинается новый.
+    """
     global _file, _day
     day = time.strftime("%Y-%m-%d")
     if day != _day:
         if _file is not None:
             _file.close()
         os.makedirs(LOG_DIR, exist_ok=True)
-        _file = open(os.path.join(LOG_DIR, day + ".log"), "a",
-                     encoding="utf-8")
+        _file = open(_new_name(), "w", encoding="utf-8")
         _day = day
     return _file
+
+
+def _cleanup():
+    """Удалить логи старше LOG_KEEP_DAYS дней."""
+    if not LOG_KEEP_DAYS or not os.path.isdir(LOG_DIR):
+        return
+    limit = time.time() - LOG_KEEP_DAYS * 86400
+    for name in os.listdir(LOG_DIR):
+        path = os.path.join(LOG_DIR, name)
+        if name.endswith(".log") and os.path.getmtime(path) < limit:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 class _Tee:
@@ -102,8 +136,7 @@ def start():
     sys.stderr = _Tee(sys.stderr)
     atexit.register(sys.stdout.drain)
     atexit.register(sys.stderr.drain)
-    print(f"--- запуск, лог пишется в {os.path.join(LOG_DIR, _day_name())}")
-
-
-def _day_name():
-    return time.strftime("%Y-%m-%d") + ".log"
+    _cleanup()
+    with _lock:
+        path = _open_for_today().name
+    print(f"--- запуск, лог пишется в {path}")
