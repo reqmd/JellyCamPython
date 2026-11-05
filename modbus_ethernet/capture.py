@@ -176,7 +176,11 @@ def on_write(start, values):
     global _busy_since
 
     if start <= COMMAND_REG < start + len(values):
-        if values[COMMAND_REG - start] == COMMAND_CAPTURE:
+        import sorter                   # здесь, чтобы не было кольца импортов
+        # Регистр 1 = 2 стартует и съёмку, и сортировку. Если стартовала
+        # сортировка, про съёмку не пишем - метки 65278 не будет.
+        if values[COMMAND_REG - start] == COMMAND_CAPTURE \
+                and not sorter.is_active():
             print(f"  команда съёмки (регистр {COMMAND_REG}), "
                   f"ждём метку {BUSY_VALUE} в регистре {STATUS_REG}")
 

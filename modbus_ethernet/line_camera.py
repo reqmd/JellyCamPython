@@ -28,6 +28,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 import warnings
 from collections import deque
 from ctypes import (CDLL, byref, c_float, c_int, c_uint, c_ushort,
@@ -111,6 +112,14 @@ GAP_ROWS = 12
 MIN_ROWS = 6
 TH = 15                     # порог отличия от фона
 MIN_AREA = 400              # пикселей в серии
+
+# Вырезка предметов для сортировки. Маска строится так же, как в
+# capture_simple.py, на котором набирались картинки для обучения: отличие
+# от фона, открытие ядром OPEN_K (убрать одиночные точки), замыкание
+# ядром CLOSE_K (залить разрывы контура), затем заливка дыр внутри.
+# Всё вне маски - чёрное, как в обучающей выборке.
+OPEN_K, CLOSE_K = 3, 11
+OBJECT_PAD = 6              # строк запаса сверху и снизу серии
 EDGE_OLD = 3                # столбцов у краёв полосы
 
 # Кадр для приложения: всегда такой высоты, объект по центру.
@@ -203,6 +212,15 @@ class ObjectDetector:
 
         self.pieces = deque(maxlen=self.buf_pieces)
         self.touch = deque(maxlen=self.buf_pieces)   # задетые строки
+        # Для каждой порции: (первая строка, строк, время конца захвата).
+        # По нему считается, когда камера сняла любую строку буфера.
+        self.times = deque(maxlen=self.buf_pieces)
+        # Кому отдавать готовую серию для сортировки: on_run(lo, hi).
+        # None - серии нужны только для кадров съёмки.
+        self.on_run = None
+        self.ker_open = np.ones((OPEN_K, OPEN_K), np.uint8)
+        self.ker_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                   (CLOSE_K, CLOSE_K))
         self.total = 0                  # сколько строк прошло всего
 
         self.run_lo = None              # начало текущей серии
@@ -286,13 +304,20 @@ class ObjectDetector:
         edge = hit[:, :e].any(axis=1) | hit[:, -e:].any(axis=1)
         return counts, edge
 
-    def feed(self, piece):
-        """Принимает порцию строк, возвращает готовые кадры."""
+    def feed(self, piece, t_end=None):
+        """
+        Принимает порцию строк, возвращает готовые кадры.
+
+        t_end - когда захват порции закончился (time.monotonic). Нужно
+        сортировке: задержка до клапанов отсчитывается от прохода
+        предмета под камерой.
+        """
         counts, edge = self.row_stats(piece)
         busy = counts >= MIN_ROW_PIXELS
 
         self.pieces.append(piece)
         self.touch.append(counts >= TOUCH_PIXELS)
+        self.times.append((self.total, piece.shape[0], t_end))
         base = self.total
         self.total += piece.shape[0]
 
@@ -333,7 +358,15 @@ class ObjectDetector:
         self.run_px = 0
         self.run_edge = False
         self.gap = 0
-        if force or edge or hi - lo < MIN_ROWS or px < MIN_AREA:
+        if force or hi - lo < MIN_ROWS or px < MIN_AREA:
+            self.rejected += 1
+            return
+        # Сортировке серия нужна, даже если задела край полосы: предметы
+        # у края отсеиваются поштучно при вырезке, а остальные в той же
+        # серии сортируются как обычно.
+        if self.on_run is not None:
+            self.on_run(lo, hi)
+        if edge:
             self.rejected += 1
             return
         self.pending.append((lo, hi))
@@ -351,6 +384,79 @@ class ObjectDetector:
             self.pending.pop(0)
             out.append(self._window(lo, hi))
         return out
+
+    def row_time(self, row):
+        """
+        Когда камера сняла абсолютную строку row (time.monotonic) или None.
+
+        Порция кончается в момент возврата из захвата; строки внутри неё
+        идут по времени сверху вниз с частотой ROWS_PER_SEC. Постоянная
+        задержка передачи по USB сюда не входит - её поглощает задержка
+        клапанов, которую подбирают на машине.
+        """
+        for first, n, t_end in self.times:
+            if first <= row < first + n:
+                if t_end is None:
+                    return None
+                return t_end - (first + n - row) / ROWS_PER_SEC
+        return None
+
+    def extract_objects(self, lo, hi):
+        """
+        Предметы серии строк [lo, hi) - по одному на каждый.
+
+        В одной серии может ехать несколько предметов бок о бок: каждый
+        вырезается отдельно, со своей рамкой по ширине - по ней выбирается
+        клапан. Вырезка делается по маске на чёрном фоне, как в обучающей
+        выборке.
+
+        Возвращает (предметы, отсеяно у края). Предмет - словарь:
+            x0, x1     столбцы сенсора, [x0, x1)
+            row0, row1 абсолютные строки, [row0, row1)
+            area       пикселей в маске
+            crop       BGR, вне маски чёрное
+            t_front    когда камера сняла передний край, или None
+        """
+        first = self.total - sum(p.shape[0] for p in self.pieces)
+        start = max(first, lo - OBJECT_PAD)
+        stop = min(self.total, hi + OBJECT_PAD)
+        rows = self._rows(start, stop - start)
+
+        d = rows[:, X0:X1].astype(np.int16) - self.full_bg[X0:X1].astype(
+            np.int16)
+        d -= np.median(d[:, ::8], axis=1, keepdims=True).astype(np.int16)
+        mask = (np.abs(d) > TH).any(axis=2).astype(np.uint8) * 255
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.ker_open)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
+
+        n, lab, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+        found, at_edge = [], 0
+        for i in range(1, n):
+            x, y, w, h, area = (int(v) for v in st[i])
+            if area < MIN_AREA:
+                continue
+            # Кончик соседней серии, попавший в запас сверху или снизу:
+            # его середина лежит вне нашей серии, он сортируется в своей.
+            if not lo <= start + y + h // 2 < hi:
+                continue
+            if x < EDGE_OLD or x + w > (X1 - X0) - EDGE_OLD:
+                at_edge += 1                 # обрезан краем полосы
+                continue
+            m = (lab[y:y + h, x:x + w] == i).astype(np.uint8)
+            # Залить дыры внутри предмета: внешний контур целиком.
+            cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+            filled = np.zeros_like(m)
+            cv2.drawContours(filled, cnts, -1, 1, thickness=cv2.FILLED)
+            crop = rows[y:y + h, X0 + x:X0 + x + w].copy()
+            crop[filled == 0] = 0
+            found.append({
+                "x0": X0 + x, "x1": X0 + x + w,
+                "row0": start + y, "row1": start + y + h,
+                "area": area, "crop": crop,
+                "t_front": self.row_time(start + y),
+            })
+        return found, at_edge
 
     def _rows(self, start, n):
         """n строк потока подряд, начиная с абсолютной строки start."""
@@ -470,6 +576,7 @@ class LineCamera:
         self.gap_n = 0
         self.rate_warned = False
         self.recoveries = 0
+        self.sort_errors = 0
         self.objects = 0
         self.detector = None
 
@@ -641,6 +748,7 @@ class LineCamera:
                 self.gap_max = max(self.gap_max, g)
             rc = self.ksj.KSJ_CaptureRgbData(IDX, buf)
             last_end = time.perf_counter()
+            t_end = time.monotonic()        # для сортировки, см. row_time
             if not skip:
                 self.call_sum += (last_end - t0) * 1000
                 self._check_rate()
@@ -704,7 +812,7 @@ class LineCamera:
             try:
                 # Номер порции нужен детектору: по пропуску в нумерации он
                 # понимает, что поток разорвался, и сбрасывает окно.
-                self.frames.put_nowait((seq, piece))
+                self.frames.put_nowait((seq, piece, t_end))
             except queue.Full:
                 self.dropped += 1
                 if self.dropped in (1, 10, 100, 1000):
@@ -720,10 +828,11 @@ class LineCamera:
               f"{det.buf_pieces * self.height} строк "
               f"({det.buf_pieces * self.height / ROWS_PER_SEC * 1000:.0f} мс), "
               f"серия рвётся на {GAP_ROWS} пустых строках")
+        det.on_run = lambda lo, hi: self._on_run(det, lo, hi)
         expected = None
         while self._running:
             try:
-                seq, piece = self.frames.get(timeout=1.0)
+                seq, piece, t_end = self.frames.get(timeout=1.0)
             except queue.Empty:
                 continue
 
@@ -737,13 +846,34 @@ class LineCamera:
             expected = seq + 1
             self._update_graph(piece)
 
-            for frame in det.feed(piece):
+            for frame in det.feed(piece, t_end):
                 self.objects += 1
                 with self._lock:
                     self._latest = frame
                     self._latest_id = self.objects
                 print(f"  камера: объект {self.objects}, "
                       f"кадр {frame.shape[1]}x{frame.shape[0]}")
+
+    def _on_run(self, det, lo, hi):
+        """
+        Серия закончилась. Если идёт сортировка - вырезать предметы и
+        отдать сортировщику. Вырезка делается здесь же, в потоке
+        детекции: строки серии лежат в буфере только пока он не провернулся.
+        Сама классификация идёт в потоке сортировщика и детекцию не держит.
+        """
+        sink = _object_sink
+        if sink is None:
+            return
+        try:
+            objs, at_edge = det.extract_objects(lo, hi)
+            sink(objs, at_edge)
+        except Exception:
+            # Ошибка вырезки не должна ронять поток детекции.
+            self.sort_errors += 1
+            if self.sort_errors in (1, 10, 100, 1000):
+                print(f"  камера: ошибка при вырезке предметов для "
+                      f"сортировки (всего {self.sort_errors}):")
+                traceback.print_exc()
 
     # --- фон ------------------------------------------------------------
 
@@ -766,7 +896,7 @@ class LineCamera:
                 # кадра, причём молча. Дешевле пересобрать, чем ловить потом.
                 # В очереди лежат пары (номер порции, строки) - номер нужен
                 # детектору, чтобы замечать разрывы потока.
-                _, piece = self.frames.get(timeout=self.piece_sec * 6 + 10)
+                piece = self.frames.get(timeout=self.piece_sec * 6 + 10)[1]
                 now = np.median(piece, axis=0).astype(np.int16)
                 diff = np.abs(now - bg.astype(np.int16))[X0:X1].mean()
                 if diff <= BG_MAX_DRIFT:
@@ -791,7 +921,7 @@ class LineCamera:
         cal = []
         while rows < BG_ROWS:
             try:
-                _, piece = self.frames.get(timeout=self.piece_sec * 6 + 10)
+                piece = self.frames.get(timeout=self.piece_sec * 6 + 10)[1]
             except queue.Empty:
                 raise CameraError("камера не отдаёт данные при сборе фона")
             cal.append(piece)
@@ -881,6 +1011,16 @@ class LineCamera:
 _camera = None
 _start_error = None
 _thread = None
+_object_sink = None
+
+
+def set_object_sink(sink):
+    """
+    Кому отдавать предметы во время сортировки: sink(предметы, у_края).
+    None - не отдавать никому, детектор работает только на съёмку.
+    """
+    global _object_sink
+    _object_sink = sink
 
 
 def _startup():

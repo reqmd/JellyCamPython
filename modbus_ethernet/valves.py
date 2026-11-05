@@ -236,6 +236,29 @@ def fire(valve, duration=TEST_DURATION):
     return True
 
 
+def fire_many(valves, duration):
+    """
+    Открыть несколько клапанов платы одним кадром - для сортировки.
+    Печатает только ошибки: что и почему открыто, пишет сортировщик.
+    True, если кадр ушёл.
+    """
+    global _board
+    board = _get_board()
+    if board is None:
+        return False
+    try:
+        board.open_valves(list(valves), duration)
+    except Exception as e:
+        print(f"клапаны: ошибка отправки по SPI: {e}")
+        try:
+            board.spi.close()
+        except Exception:
+            pass
+        _board = None
+        return False
+    return True
+
+
 def close_all():
     """Закрыть все клапаны. True, если кадр ушёл."""
     board = _get_board()
