@@ -19,8 +19,6 @@ check0_base_optimize.onnx
 check2_correct_ops.onnx
 check3_fuse_ops.onnx
 modbus_ethernet/__pycache__
-modbus_ethernet/valves.json
-modbus_ethernet/config.json
 modbus_ethernet/background.npy
 /objects
 /calib
@@ -30,3 +28,11 @@ dataset.txt
 preview.png
 preview_npu.png
 modbus_ethernet/background_rows_flip.npy
+modbus_ethernet/crops/
+modbus_ethernet/calib.png
+modbus_ethernet/config.json.bak
+modbus_ethernet/dark.npy
+modbus_ethernet/flat.npy
+modbus_ethernet/snap.png
+modbus_ethernet/snap_mask.png
+modbus_ethernet/snap_raw.png

@@ -17,10 +17,13 @@
 
     LD_LIBRARY_PATH=/opt/ksjapi/arm64 python3 dsp_protocol.py
 
-Отдельно этот файл запускается для проверки камеры без сервера:
+Проверки и калибровки камеры (снимок, подборы выдержки, усиления,
+чёрного, выравнивание) - в camera_tools.py:
 
-    LD_LIBRARY_PATH=/opt/ksjapi/arm64 python3 line_camera.py
-    python3 line_camera.py --selftest      # детекция без железа
+    python3 camera_tools.py --selftest     # детекция без железа
+    python3 camera_tools.py --snap 3       # что видит камера
+
+Старые вызовы "python3 line_camera.py --ключ" тоже работают.
 """
 
 import os
@@ -53,16 +56,31 @@ else:
 IDX = 0
 SENSOR_WIDTH = 2048
 SENSOR_ROWS = 2             # физических ряда у сенсора Awaiba
-LINES = 64                  # считываний сенсора в порции
-EXPOSURE_MS = 0.1           # выдержка строки, мс
+LINES = 8                   # считываний сенсора в порции: 4 мс при 2000
+# Выдержка строки, мс. Предел - меньше половины периода считывания
+# (оба ряда сенсора экспонируются по очереди): при 2000 в секунду это
+# до 0.24 мс, при 4000 - до 0.12. Проверка: --exposure-sweep.
+EXPOSURE_MS = 0.1
 TRIGGER_MODE = 3            # 3 = фиксированная частота строк
-# Считываний в секунду. Больше 4000 эта камера не держит: при 8000 порция
+# Считываний в секунду. Рабочее значение машины - 2000 (при выдержке
+# 0.225 мс 4000 камера не держит). Больше 4000 эта камера не держит: при 8000 порция
 # приходит не раз в 8 мс, а раз в 16 - камера отдаёт каждый второй кадр, и
 # кусок ленты между порциями пропадает целиком. Предметы на стыках порций
 # от этого и резались. Проверено gapcheck.py --sweep: при 4000 и 3000 цикл
 # совпадает с расчётом, при 6000 и 8000 он ровно вдвое длиннее.
 FIXED_RATE = 4000.0
-GAIN = 200                  # усиление сегментов сенсора
+# Усиление сегментов сенсора, как его принимает KSJ_AWAIBA_SetGain:
+# 0..255, больше - ярче (проверено перебором: 0 - лента около 135, 200 -
+# в 255). Читается обратно оно перевёрнутым: KSJ_AWAIBA_GetGain отдаёт
+# 255 - значение, поэтому --color-info при 200 показывает 55. На яркость
+# сильнее усиления влияет уровень чёрного (camera.black_level).
+# Подбор: python3 camera_tools.py --gain-sweep.
+GAIN = 200
+
+
+def _gain_to_sdk(gain):
+    """Усиление из настроек -> значение для KSJ_AWAIBA_SetGain."""
+    return max(0, min(255, int(gain)))
 
 # Полоса, по которой ищутся предметы: вся освещённая лента, а не её
 # середина. Строки кадра идут на всю ширину сенсора, поэтому и решать,
@@ -97,6 +115,71 @@ BG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # Порядок строк в порции меняет и порядок строк фона, поэтому файл свой
 # для каждого режима: строки, снятые до переворота, после него легли бы
 # не той чётностью рядов сенсора.
+# Выравнивание яркости по ширине (flat field). Свет и объектив дают дугу:
+# в центре ярче, к краям темнее. SDK камеры попиксельной поправки не
+# умеет (есть только общие LUT, гамма, баланс белого и усиление на две
+# половины сенсора), поэтому каждая порция домножается здесь, сразу после
+# захвата, на свой коэффициент для каждого столбца и канала. Дальше всё -
+# график приложения, детекция, снимок, вырезки для сети - видят уже ровную
+# картинку. Коэффициенты снимаются по пустой ленте:
+#     python3 camera_tools.py --flat
+# и лежат в flat.npy. Включается в config: camera.flat_field.
+FLAT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "flat.npy")
+FLAT_PIECES = 250               # порций на калибровку
+# Чёрное: что камера даёт при закрытом объективе, по столбцу и каналу.
+# Снимается python3 camera_tools.py --dark. Вычитается из каждой порции до
+# выравнивания: иначе коэффициент выравнивания умножает и смещение
+# чёрного, и тёмные предметы получают ложный оттенок.
+DARK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "dark.npy")
+FLAT_DEFAULTS = {
+    "band": [],                 # полоса детектора [X0, X1]; пусто - из кода
+    "median": None,             # ядро медианы (1, 3, 5); None - MEDIAN_KERNEL
+    "dark_subtract": False,     # вычитать чёрное (dark.npy) до выравнивания
+    "ccm": None,                # цветовая матрица: None, "sdk" или 3x3 (RGB)
+    "black_level": None,        # уровень чёрного сегментов; None - авто
+    "gain": None,               # усиление 0..255, больше - ярче; None - GAIN
+    "sensitivity": None,        # какие 8 бит из 12 (режим SDK); None - не трогать
+    "flat_field": False,        # применять flat.npy к каждой порции
+    "flat_target": 156,         # к какой яркости приводить пустую ленту
+    "flat_per_channel": True,   # свой коэффициент на B, G, R
+    "flat_max_gain": 4.0,       # предел поправки в обе стороны
+}
+
+
+def _flat_settings():
+    """Секция camera из config.json / config.yaml поверх FLAT_DEFAULTS."""
+    cfg = dict(FLAT_DEFAULTS)
+    try:
+        from valve_config import CONFIG
+        cfg.update((CONFIG.get("camera") or {}))
+    except Exception:
+        pass
+    return cfg
+
+
+def _band_from_config():
+    """
+    Полоса детектора из config: camera.band = [от, до]. Свет и камеру
+    двигают, а полоса должна совпадать с освещённой лентой: тёмные края
+    за ней шумят, и если они попадают в полосу, каждая строка выглядит
+    "занятой" - серия предметов не кончается никогда, и предметы не
+    захватываются вовсе. Смотреть по snap.png (python3 camera_tools.py --snap).
+    """
+    global X0, X1, MEDIAN_KERNEL
+    cfg = _flat_settings()
+    if cfg.get("median") is not None:
+        k = int(cfg["median"])
+        MEDIAN_KERNEL = k if k <= 1 or k % 2 else k + 1     # только нечётное
+    band = cfg.get("band") or []
+    if len(band) == 2 and 0 <= int(band[0]) < int(band[1]) <= SENSOR_WIDTH:
+        X0, X1 = int(band[0]), int(band[1])
+
+
+_band_from_config()
+
+
 BG_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "background_rows_flip.npy" if FLIP_PIECES
                             else "background_rows.npy")
@@ -108,8 +191,8 @@ BG_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # не короче MIN_ROWS строк, набрала MIN_AREA пикселей и не задела края
 # полосы (EDGE_OLD столбцов с каждой стороны).
 MIN_ROW_PIXELS = 10
-GAP_ROWS = 12
-MIN_ROWS = 6
+GAP_ROWS = 6
+MIN_ROWS = 3
 TH = 15                     # порог отличия от фона
 MIN_AREA = 400              # пикселей в серии
 
@@ -149,6 +232,14 @@ BUFFER_ROWS = 2048
 
 QUEUE_SIZE = 64
 
+# Сколько строк отдавать детектору за раз. Порция камеры может быть совсем
+# короткой (LINES = 4 - это 8 строк, 1 мс): так камера держит длинную
+# выдержку. Но на каждую порцию у детектора есть постоянные расходы, и
+# 1000 порций в секунду он не тянет. Поэтому захват склеивает подряд
+# идущие порции в блок не меньше PROC_ROWS строк. Задержка решения от
+# этого та же, что при порции такого размера.
+PROC_ROWS = 16
+
 # Порций, выбрасываемых сразу после открытия камеры: первые кадры она
 # отдаёт неустоявшимися. Одной хватает с запасом, берём четыре - это
 # меньше 40 мс при LINES = 64.
@@ -181,6 +272,21 @@ class CameraError(RuntimeError):
 # Детектор. Работает порциями, без построчных циклов: при 16000 строк/с
 # цикл по строкам в Python не успевал бы.
 # --------------------------------------------------------------------------
+
+def _row_median(s):
+    """
+    Медиана каждой строки (по оси 1), int16, форма (строки, 1, каналы).
+    Через partition: в несколько раз быстрее np.median, результат тот же.
+    """
+    n = s.shape[1]
+    k = n // 2
+    if n % 2:
+        return np.partition(s, k, axis=1)[:, k:k + 1]
+    p = np.partition(s, (k - 1, k), axis=1)
+    # Как np.median(...).astype(int16): среднее двух средних, к нулю.
+    return ((p[:, k - 1:k].astype(np.float32) + p[:, k:k + 1]) / 2).astype(
+        np.int16)
+
 
 class ObjectDetector:
     """
@@ -229,6 +335,7 @@ class ObjectDetector:
         self.run_edge = False           # серия задела край полосы
         self.gap = 0                    # пустых строк после серии
         self.pending = []               # серии, ждущие строк снизу
+        self.frames_enabled = True      # собирать кадры для снимка
 
         self.gaps = 0                   # разрывов потока
         self.idle = 0                   # пустых порций
@@ -272,10 +379,26 @@ class ObjectDetector:
         self.pending.clear()
         self.busy_streak = 0
         self.rebuilds += 1
-        print(f"  камера: лента {self.buf_pieces * self.H} строк подряд "
-              f"считалась занятой - фон разошёлся с картинкой на "
-              f"{shift:.1f} уровня. Фон пересобран по последним строкам "
-              f"(пересборка {self.rebuilds}), детекция продолжается")
+        # Первая пересборка - подробно. Если они идут одна за другой, лента
+        # всё время выглядит занятой, и строка на каждую только забивала
+        # лог: дальше - одна сводка раз в 10 с.
+        now = time.monotonic()
+        if now - getattr(self, "_rebuild_said", -1e9) >= 10:
+            more = getattr(self, "_rebuild_quiet", 0)
+            if more:
+                print(f"  камера: фон пересобирался ещё {more} раз - лента "
+                      f"всё время выглядит занятой. Под камерой что-то "
+                      f"лежит, поменялся свет или предметы идут сплошным "
+                      f"потоком; в это время предметы могут теряться")
+            else:
+                print(f"  камера: лента {self.buf_pieces * self.H} строк "
+                      f"подряд считалась занятой - фон разошёлся с картинкой "
+                      f"на {shift:.1f} уровня. Фон пересобран по последним "
+                      f"строкам (пересборка {self.rebuilds})")
+            self._rebuild_said = now
+            self._rebuild_quiet = 0
+        else:
+            self._rebuild_quiet = getattr(self, "_rebuild_quiet", 0) + 1
 
     def note_gap(self):
         """Потеряна порция. Текущую серию закрываем: в ней дыра."""
@@ -297,14 +420,16 @@ class ObjectDetector:
         s = d[:, ::4]
         k = s.shape[1] // 2
         np.subtract(d, np.partition(s, k, axis=1)[:, k:k + 1], out=d)
-        hit = np.abs(d, out=d) > TH
-        hit = hit.any(axis=2)                        # (строки, ширина полосы)
+        np.abs(d, out=d)
+        # Максимум по трём каналам срезами, а не .any(axis=2): по последней
+        # оси numpy идёт медленно, так в несколько раз быстрее.
+        hit = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2]) > TH
         counts = hit.sum(axis=1) * COL_STEP          # в пикселях сенсора
         e = max(1, EDGE_OLD // COL_STEP)
         edge = hit[:, :e].any(axis=1) | hit[:, -e:].any(axis=1)
         return counts, edge
 
-    def feed(self, piece, t_end=None):
+    def feed(self, piece, t_end=None, lag=0.0):
         """
         Принимает порцию строк, возвращает готовые кадры.
 
@@ -317,7 +442,7 @@ class ObjectDetector:
 
         self.pieces.append(piece)
         self.touch.append(counts >= TOUCH_PIXELS)
-        self.times.append((self.total, piece.shape[0], t_end))
+        self.times.append((self.total, piece.shape[0], t_end, lag))
         base = self.total
         self.total += piece.shape[0]
 
@@ -366,6 +491,12 @@ class ObjectDetector:
         # серии сортируются как обычно.
         if self.on_run is not None:
             self.on_run(lo, hi)
+        if not self.frames_enabled:
+            # Идёт сортировка: кадр для снимка никому не нужен, а его сборка
+            # (подмена соседей фоном, медианы) занимает поток детекции на
+            # несколько миллисекунд и задерживает решение по следующим
+            # предметам.
+            return
         if edge:
             self.rejected += 1
             return
@@ -394,12 +525,19 @@ class ObjectDetector:
         задержка передачи по USB сюда не входит - её поглощает задержка
         клапанов, которую подбирают на машине.
         """
-        for first, n, t_end in self.times:
+        for first, n, t_end, _ in self.times:
             if first <= row < first + n:
                 if t_end is None:
                     return None
                 return t_end - (first + n - row) / ROWS_PER_SEC
         return None
+
+    def row_lag(self, row):
+        """На сколько мс позже своего времени камера отдала эту строку."""
+        for first, n, _, lag in self.times:
+            if first <= row < first + n:
+                return lag
+        return 0.0
 
     def extract_objects(self, lo, hi):
         """
@@ -424,8 +562,12 @@ class ObjectDetector:
 
         d = rows[:, X0:X1].astype(np.int16) - self.full_bg[X0:X1].astype(
             np.int16)
-        d -= np.median(d[:, ::8], axis=1, keepdims=True).astype(np.int16)
-        mask = (np.abs(d) > TH).any(axis=2).astype(np.uint8) * 255
+        d -= _row_median(d[:, ::8])
+        np.abs(d, out=d)
+        # Сортировка ждёт эту вырезку: максимум по каналам срезами вместо
+        # .any(axis=2) - 0,1 мс вместо 1,7.
+        mask = ((np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2]) > TH)
+                .astype(np.uint8) * 255)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.ker_open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
 
@@ -449,12 +591,18 @@ class ObjectDetector:
             filled = np.zeros_like(m)
             cv2.drawContours(filled, cnts, -1, 1, thickness=cv2.FILLED)
             crop = rows[y:y + h, X0 + x:X0 + x + w].copy()
+            if MEDIAN_KERNEL > 1:
+                # Та же медиана, что у снимка в take(): решётка двух рядов
+                # сенсора убрана, и сеть видит предмет таким же, как на
+                # снимках, по которым её учили.
+                crop = cv2.medianBlur(crop, MEDIAN_KERNEL)
             crop[filled == 0] = 0
             found.append({
                 "x0": X0 + x, "x1": X0 + x + w,
                 "row0": start + y, "row1": start + y + h,
                 "area": area, "crop": crop,
                 "t_front": self.row_time(start + y),
+                "cam_lag_ms": self.row_lag(start + y),
             })
         return found, at_edge
 
@@ -565,6 +713,13 @@ class ObjectDetector:
 # --------------------------------------------------------------------------
 
 class LineCamera:
+    tap = None                  # список: грабер копит сюда сырые порции
+    dark2 = None                # (2, 2048, 3) uint8 - чёрное по рядам, или None
+    flat2 = None                # (2, 2048, 3) float32 - выравнивание, или None
+    _tiles = {}
+    ccm = None                  # 3x3 float32 для BGR или None
+    tap_max = FLAT_PIECES       # сколько порций копить в tap
+
     def __init__(self):
         self.ksj = None
         self.width = self.height = self.channels = 0
@@ -573,6 +728,10 @@ class LineCamera:
         self.grabbed = 0
         self.dropped = 0
         self.gap_sum = self.gap_max = self.call_sum = 0.0
+        # Порции, которые камера отдала не сразу, а из буфера драйвера:
+        # сколько их и на сколько мс их время возврата позже съёмки.
+        self.lag_n = self.lag_late = 0
+        self.lag_sum = self.lag_max = 0.0
         self.gap_n = 0
         self.rate_warned = False
         self.recoveries = 0
@@ -604,7 +763,12 @@ class LineCamera:
         self._graph_at = now
 
         # Камера отдаёт BGR, приложение ждёт R, G, B - разворачиваем каналы.
-        line = piece[0][:, ::-1].astype(np.float32)
+        # Среднее по всем строкам порции (оба ряда сенсора, 8-16 строк), а не
+        # одна строка. Зелёный у этой камеры шумит от строки к строке вдвое
+        # сильнее синего и вчетверо сильнее красного (--gain-sweep), и по
+        # одной строке на графике он выглядел толстой полосой. Предмет в
+        # порции график и так искажал бы - он для настройки по пустой ленте.
+        line = piece.mean(axis=0)[:, ::-1].astype(np.float32)
 
         if self._avg_acc is None:
             self._avg_acc = line.copy()
@@ -655,11 +819,24 @@ class LineCamera:
 
         # Усиление и чёрный уровень по сегментам сенсора. Без этого кадр
         # может оказаться чёрным, а ряды - отличаться по яркости.
+        # Уровень чёрного: авто сенсора обрезало тёмное в 0 (замер с
+        # закрытым объективом давал 0 во всех каналах), и тёмные предметы
+        # теряли цвет. Поэтому его можно задать числом: camera.black_level,
+        # подбирается python3 camera_tools.py --black-sweep.
+        cfg = _flat_settings()
+        gain = GAIN if cfg.get("gain") is None else int(cfg["gain"])
+        black = cfg.get("black_level")
         segs = c_int()
         if ksj.KSJ_AWAIBA_GetSegmentNum(IDX, byref(segs)) >= 0:
             for sgm in range(segs.value):
-                ksj.KSJ_AWAIBA_SetGain(IDX, sgm, GAIN)
-                ksj.KSJ_AWAIBA_AutoBlackLevel(IDX, sgm)
+                ksj.KSJ_AWAIBA_SetGain(IDX, sgm, _gain_to_sdk(gain))
+                if black is None:
+                    ksj.KSJ_AWAIBA_AutoBlackLevel(IDX, sgm)
+                else:
+                    ksj.KSJ_AWAIBA_SetBlackLevel(IDX, sgm, int(black))
+        sens = cfg.get("sensitivity")
+        if sens is not None and hasattr(ksj, "KSJ_SensitivitySetMode"):
+            ksj.KSJ_SensitivitySetMode(IDX, int(sens))
 
     def open(self):
         ksj = self._load()
@@ -687,8 +864,13 @@ class LineCamera:
 
         self.ksj = ksj
         self.piece_sec = piece_sec
+        self.group = max(1, -(-PROC_ROWS // self.height))
+        self.chunk_rows = self.height * self.group
         print(f"  камера: порция {self.width}x{self.height} "
-              f"({piece_sec*1000:.1f} мс), {ROWS_PER_SEC:.0f} строк/с")
+              f"({piece_sec*1000:.1f} мс), {ROWS_PER_SEC:.0f} строк/с"
+              + (f"; детектору - блоками по {self.group} порции "
+                 f"({self.chunk_rows} строк, {piece_sec*self.group*1000:.1f}"
+                 f" мс)" if self.group > 1 else ""))
 
     def close(self):
         self._running = False
@@ -736,6 +918,9 @@ class LineCamera:
         failed = False          # была ошибка, ждём первую удачную порцию
         level_ok = None         # яркость ленты до сбоя
         level_check = False     # сравнить яркость после восстановления
+        piece_sec = LINES / FIXED_RATE
+        prev_true = None        # когда на самом деле снята прошлая порция
+        acc, acc_lag = [], 0.0  # порции, копящиеся в блок для детектора
         while self._running:
             t0 = time.perf_counter()
             if last_end is not None and not skip:
@@ -753,6 +938,8 @@ class LineCamera:
                 self.call_sum += (last_end - t0) * 1000
                 self._check_rate()
             if rc < 0:
+                prev_true = None
+                acc.clear()
                 self.errors[rc] = self.errors.get(rc, 0) + 1
                 if self.errors[rc] in (1, 100, 1000):
                     print(f"  камера: ошибка захвата {rc} "
@@ -781,14 +968,40 @@ class LineCamera:
             # несуществующий объект. Поэтому выбрасываем их здесь, до всех
             # потребителей сразу.
             if skip:
+                prev_true = None
                 skip -= 1
                 if skip == 0:
                     print(f"  камера: пропущено {SKIP_PIECES} порций "
                           f"на прогрев")
                 continue
 
+            # Когда порция снята на самом деле. Камера снимает по своим
+            # часам, ровно раз в piece_sec, а не когда её спросили. Если
+            # поток захвата задержался (Python отдал процессор другому
+            # потоку), готовые порции копятся в драйвере, и следующие
+            # вызовы возвращают их сразу, одну за другой. Время возврата
+            # у них - "сейчас", а сняты они раньше, и предмет считался
+            # прошедшим под камерой позже, чем на самом деле: клапан
+            # открывался с опозданием на эту величину, разным для разных
+            # предметов. Отличаем такие порции по длительности вызова:
+            # свежую камера ждёт почти всю порцию, накопленную отдаёт
+            # сразу. Свежая - время возврата и есть время съёмки, у
+            # накопленной оно на одну порцию позже предыдущей.
+            call = last_end - t0
+            if (prev_true is None or call >= piece_sec * 0.5
+                    or t_end < prev_true + piece_sec):
+                t_true = t_end
+            else:
+                t_true = prev_true + piece_sec
+            prev_true = t_true
+            lag = (t_end - t_true) * 1000
+            self.lag_n += 1
+            self.lag_sum += lag
+            self.lag_max = max(self.lag_max, lag)
+            if lag > piece_sec * 1000:
+                self.lag_late += 1
+
             self.grabbed += 1
-            seq += 1
             piece = np.frombuffer(buf, np.uint8).reshape(
                 self.height, self.width, self.channels)
             # Камера отдаёт строки порции в обратном порядке: сверху самая
@@ -809,10 +1022,22 @@ class LineCamera:
                       f"после восстановления {now}")
             else:
                 level_ok = level
+            tap = self.tap
+            if tap is not None and len(tap) < self.tap_max:
+                tap.append(piece)           # калибровка: сырые порции
+            acc.append(piece)
+            acc_lag = max(acc_lag, lag) if len(acc) > 1 else lag
+            if len(acc) < self.group:
+                continue
+            piece = acc[0] if len(acc) == 1 else np.concatenate(acc)
+            lag = acc_lag
+            acc = []
+            seq += 1
+            piece = self.process(piece)
             try:
                 # Номер порции нужен детектору: по пропуску в нумерации он
                 # понимает, что поток разорвался, и сбрасывает окно.
-                self.frames.put_nowait((seq, piece, t_end))
+                self.frames.put_nowait((seq, piece, t_true, lag))
             except queue.Full:
                 self.dropped += 1
                 if self.dropped in (1, 10, 100, 1000):
@@ -821,18 +1046,18 @@ class LineCamera:
                           f"увеличьте LINES или уменьшите FIXED_RATE")
 
     def _detector(self, background):
-        det = ObjectDetector(background, self.height,
+        det = ObjectDetector(background, self.chunk_rows,
                              getattr(self, "bg_rows", None))
         self.detector = det
         print(f"  буфер {det.buf_pieces} порций = "
-              f"{det.buf_pieces * self.height} строк "
-              f"({det.buf_pieces * self.height / ROWS_PER_SEC * 1000:.0f} мс), "
+              f"{det.buf_pieces * self.chunk_rows} строк "
+              f"({det.buf_pieces * self.chunk_rows / ROWS_PER_SEC * 1000:.0f} мс), "
               f"серия рвётся на {GAP_ROWS} пустых строках")
         det.on_run = lambda lo, hi: self._on_run(det, lo, hi)
         expected = None
         while self._running:
             try:
-                seq, piece, t_end = self.frames.get(timeout=1.0)
+                seq, piece, t_end, lag = self.frames.get(timeout=1.0)
             except queue.Empty:
                 continue
 
@@ -845,8 +1070,11 @@ class LineCamera:
                           f"от пяти подряд объект теряется")
             expected = seq + 1
             self._update_graph(piece)
+            det.frames_enabled = _object_sink is None
+            if not _detect_enabled:
+                continue            # калибровка: детекция не нужна
 
-            for frame in det.feed(piece, t_end):
+            for frame in det.feed(piece, t_end, lag):
                 self.objects += 1
                 with self._lock:
                     self._latest = frame
@@ -865,7 +1093,14 @@ class LineCamera:
         if sink is None:
             return
         try:
+            t0 = time.monotonic()
             objs, at_edge = det.extract_objects(lo, hi)
+            # Для разбивки задержки в сводке сортировки: когда детектор
+            # увидел конец серии и сколько заняла вырезка.
+            t1 = time.monotonic()
+            for o in objs:
+                o["t_found"] = t0
+                o["cut_ms"] = (t1 - t0) * 1000
             sink(objs, at_edge)
         except Exception:
             # Ошибка вырезки не должна ронять поток детекции.
@@ -937,8 +1172,100 @@ class LineCamera:
 
     # --- публичный интерфейс --------------------------------------------
 
+    def process(self, piece):
+        """
+        Поправки к сырым строкам, по порядку: вычесть чёрное, выровнять
+        яркость по ширине, цветовая матрица. Одна функция и для работы, и
+        для camera_tools (--snap), чтобы снимок показывал ровно то, что
+        видит детектор. Высота piece - любая чётная.
+        """
+        n = piece.shape[0]
+        if self.dark2 is not None:
+            piece = cv2.subtract(piece, self._tile("dark", self.dark2, n))
+        if self.flat2 is not None:
+            # По коэффициенту на столбец, канал и ряд сенсора, с насыщением
+            # в 0..255. cv2 делает это в своих потоках, ~0,1 мс на блок.
+            piece = cv2.multiply(piece, self._tile("flat", self.flat2, n),
+                                 dtype=cv2.CV_8U)
+        if self.ccm is not None:
+            # Каждый канал - смесь трёх: убирает перекрёстную
+            # чувствительность фильтров сенсора.
+            piece = cv2.transform(piece, self.ccm)
+        return piece
+
+    def _tile(self, name, two, n):
+        """(2, ширина, 3) -> (n, ширина, 3): ряды сенсора через строку."""
+        key = (name, n)
+        t = self._tiles.get(key)
+        if t is None:
+            t = np.ascontiguousarray(two[np.arange(n) % 2])
+            self._tiles[key] = t
+        return t
+
+    def _load_color(self, cfg):
+        """Чёрное и цветовая матрица - по настройкам camera."""
+        self.dark2 = self.ccm = None
+        self._tiles = {}
+        if cfg.get("dark_subtract"):
+            if os.path.exists(DARK_FILE):
+                dark = np.load(DARK_FILE)
+                self.dark2 = np.clip(np.round(dark), 0, 255).astype(np.uint8)
+                print(f"  вычитание чёрного включено: B G R "
+                      + " ".join(f"{v:.1f}" for v in
+                                 dark[:, X0:X1].mean(axis=(0, 1))))
+            else:
+                print(f"  вычитание чёрного ВКЛЮЧЕНО, но нет {DARK_FILE} - "
+                      f"снимите: python3 camera_tools.py --dark")
+        m = cfg.get("ccm")
+        if m is not None:
+            if m == "sdk":
+                m9 = (c_float * 9)()
+                if self.ksj.KSJ_ColorCorrectionMatrixGet(IDX, m9) < 0:
+                    print("  цветовая матрица: SDK её не отдал, без неё")
+                    return
+                m = [[m9[r_ * 3 + c_] for c_ in range(3)] for r_ in range(3)]
+            rgb = np.array(m, np.float32).reshape(3, 3)
+            # Матрица задана для R, G, B, а порции - B, G, R: разворачиваем
+            # и строки, и столбцы.
+            self.ccm = np.ascontiguousarray(rgb[::-1, ::-1])
+            print("  цветовая матрица включена (R G B):\n"
+                  + "\n".join("    " + " ".join(f"{v:7.3f}" for v in row)
+                               for row in rgb))
+
+    def _load_flat(self):
+        """Коэффициенты выравнивания, если оно включено и файл есть."""
+        cfg = _flat_settings()
+        self._load_color(cfg)
+        self.flat2 = None
+        if not cfg.get("flat_field"):
+            print("  выравнивание яркости по ширине выключено "
+                  "(camera.flat_field)")
+            return
+        if not os.path.exists(FLAT_FILE):
+            print(f"  выравнивание яркости ВКЛЮЧЕНО, но нет {FLAT_FILE} - "
+                  f"снимите: python3 camera_tools.py --flat; пока без него")
+            return
+        gain = np.load(FLAT_FILE).astype(np.float32)
+        if gain.ndim == 2:                  # старый файл: один на оба ряда
+            gain = np.stack([gain, gain])
+        if gain.shape[1:] != (self.width, self.channels):
+            print(f"  {FLAT_FILE}: форма {gain.shape}, а у камеры "
+                  f"{(self.width, self.channels)} - снимите заново; пока "
+                  f"без выравнивания")
+            return
+        # Строки порции идут через одну из двух рядов сенсора (чётные -
+        # из одного, нечётные - из другого), у каждого ряда свои
+        # коэффициенты. Порция всегда чётной высоты, чередование
+        # от порции к порции не сбивается.
+        self.flat2 = gain
+        band = gain[:, X0:X1]
+        print(f"  выравнивание яркости включено ({os.path.basename(FLAT_FILE)}"
+              f"): поправка в полосе от x{band.min():.2f} до "
+              f"x{band.max():.2f}")
+
     def start(self):
         self.open()
+        self._load_flat()
         self._running = True
 
         t = threading.Thread(target=self._grabber, daemon=True,
@@ -989,6 +1316,11 @@ class LineCamera:
             extra += f", фон пересобран {d.rebuilds} раз"
         if self.recoveries:
             extra += f", восстановлений после ошибки {self.recoveries}"
+        if self.lag_n:
+            extra += (f", порций из буфера драйвера {self.lag_late} из "
+                      f"{self.lag_n}, опоздание отметки времени сред "
+                      f"{self.lag_sum / self.lag_n:.2f} / макс "
+                      f"{self.lag_max:.1f} мс (исправлено)")
         if self.gap_n:
             extra += (f", захват {self.call_sum / self.gap_n:.2f} мс, "
                       f"между захватами сред {self.gap_sum / self.gap_n:.3f}"
@@ -1124,165 +1456,15 @@ def stop():
         _camera = None
 
 
-# --------------------------------------------------------------------------
-# Проверки
-# --------------------------------------------------------------------------
-
-def selftest():
-    """Проверяет детекцию, высоту кадра и центрирование без камеры."""
-    rng = np.random.default_rng(0)
-    w, ch = SENSOR_WIDTH, 3
-    piece_rows = LINES * SENSOR_ROWS
-    full_bg = np.full((w, ch), 90, np.uint8)
-
-    def stream(det, specs):
-        """specs: список (строк, есть ли объект). Возвращает кадры."""
-        out = []
-        for rows, obj, *rest in specs:
-            drift = rest[0] if rest else 0
-            done = 0
-            while done < rows:
-                n = min(piece_rows, rows - done)
-                p = rng.integers(85, 96, size=(n, w, ch), dtype=np.int16)
-                p += drift                      # общий дрейф подсветки
-                if obj:
-                    p[:, X0 + 150:X0 + 450] = rng.integers(
-                        180, 230, size=(n, 300, ch))
-                p = np.clip(p, 0, 255).astype(np.uint8)
-                if p.shape[0] < piece_rows:     # порция всегда целая
-                    pad = np.repeat(p[-1:], piece_rows - p.shape[0], axis=0)
-                    p = np.vstack([p, pad])
-                out.extend(det.feed(p))
-                done += piece_rows
-        return out
-
-    def object_rows(frame):
-        band = frame[:, X0:X1].astype(np.int16)
-        d = band - full_bg[X0:X1].astype(np.int16)
-        d -= np.median(d[:, ::8], axis=1, keepdims=True).astype(np.int16)
-        fg = (np.abs(d) > TH).any(axis=2).sum(axis=1)
-        rows = np.flatnonzero(fg >= 20)
-        return (int(rows[0]), int(rows[-1])) if rows.size else None
-
-    ok = True
-    print(f"порция {piece_rows} строк, кадр {FRAME_HEIGHT} строк, "
-          f"разрыв серии {GAP_ROWS} строк\n")
-
-    for length in (64, 128, 256):
-        det = ObjectDetector(full_bg, piece_rows)
-        found = stream(det, [(512, False), (length, True), (1536, False)])
-        if len(found) != 1:
-            print(f"  объект {length:4d} строк: кадров {len(found)}, ожидался 1")
-            ok = False
-            continue
-        frame = found[0]
-        span = object_rows(frame)
-        if span is None:
-            print(f"  объект {length:4d} строк: в кадре его нет")
-            ok = False
-            continue
-        top, bottom = span
-        offset = (top + bottom) / 2 - FRAME_HEIGHT / 2
-        good = (frame.shape == (FRAME_HEIGHT, w, ch) and abs(offset) <= 24)
-        ok = ok and good
-        print(f"  объект {length:4d} строк -> кадр {frame.shape[0]}x"
-              f"{frame.shape[1]}, строки {top}..{bottom}, "
-              f"смещение центра {offset:+.0f}  {'ок' if good else 'ПЛОХО'}")
-
-    # Главная проверка: дрейф подсветки не должен приниматься за объект.
-    det = ObjectDetector(full_bg, piece_rows)
-    drifted = stream(det, [(512, False, 0), (1024, False, 25),
-                           (1024, False, -25), (512, False, 0)])
-    print(f"\n  дрейф подсветки на +-25 уровней: кадров {len(drifted)} "
-          f"(ожидалось 0)")
-    ok = ok and len(drifted) == 0
-
-    # Шум без объекта тоже не должен срабатывать.
-    det = ObjectDetector(full_bg, piece_rows)
-    noise = stream(det, [(4096, False)])
-    print(f"  чистый фон 4096 строк: кадров {len(noise)} (ожидалось 0)")
-    ok = ok and len(noise) == 0
-
-    # Два объекта подряд не должны потеряться и не должны задвоиться.
-    det = ObjectDetector(full_bg, piece_rows)
-    two = stream(det, [(512, False), (128, True), (768, False),
-                       (128, True), (1536, False)])
-    print(f"  два объекта подряд: кадров {len(two)} (ожидалось 2)")
-    ok = ok and len(two) == 2
-
-    print("\nдетектор:", "работает" if ok else "НЕ РАБОТАЕТ")
-    return ok
-
-
-def show_graph():
-    """
-    Живой график яркости строки, как в graph.py. Нужен дисплей.
-
-    Берёт ту же строку, что уходит приложению, поэтому годится для
-    настройки освещения и усиления: что видно здесь, то увидит и
-    приложение в блоке 106.
-    """
-    import matplotlib.pyplot as plt
-
-    begin()
-    while not ready() and not failed():
-        time.sleep(0.1)
-    if failed():
-        raise SystemExit(1)
-
-    x = np.arange(SENSOR_WIDTH)
-    plt.ion()
-    fig, ax = plt.subplots()
-    lines = [ax.plot(x, np.zeros(SENSOR_WIDTH), c + '-', label=n)[0]
-             for c, n in (('r', 'R'), ('g', 'G'), ('b', 'B'))]
-    ax.set_ylim(0, GRAPH_MAX)
-    ax.set_xlim(0, SENSOR_WIDTH)
-    ax.set_xlabel('Линия пикселей')
-    ax.set_ylabel('Яркость')
-    ax.legend()
-
-    while plt.fignum_exists(fig.number):
-        flat = live_graph()
-        if flat is None:
-            plt.pause(0.05)
-            continue
-        rgb = flat.reshape(SENSOR_WIDTH, 3)
-        for i, ln in enumerate(lines):
-            ln.set_ydata(rgb[:, i])
-        fig.canvas.draw()
-        fig.canvas.flush_events()
-        plt.pause(0.02)
-    stop()
+# False - камера только снимает, без детекции: так её запускают калибровки
+# в camera_tools.py.
+_detect_enabled = True
 
 
 def main():
-    if "--selftest" in sys.argv:
-        raise SystemExit(0 if selftest() else 1)
-    if "--graph" in sys.argv:
-        show_graph()
-        return
-
-    begin()
-    while not ready() and not failed():
-        time.sleep(0.1)
-    if failed():
-        raise SystemExit(1)
-    print("жду предметы, Ctrl+C для выхода")
-    arm()
-    saved = 0
-    try:
-        while True:
-            frame = take()
-            if frame is not None:
-                name = "frame_%03d.png" % saved
-                cv2.imwrite(name, frame)
-                saved += 1
-                print(f"  сохранено {name}  [{status()}]")
-            time.sleep(0.02)
-    except KeyboardInterrupt:
-        print("\n" + status())
-    finally:
-        stop()
+    """Проверки и калибровки теперь в camera_tools.py; старые ключи работают."""
+    import camera_tools
+    camera_tools.main()
 
 
 if __name__ == "__main__":

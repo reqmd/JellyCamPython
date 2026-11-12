@@ -79,6 +79,17 @@ def _cleanup():
                 pass
 
 
+def _stamp():
+    """Время строки лога с миллисекундами: 2026-11-05 14:16:02.137.
+
+    Секунд мало, чтобы понять, сколько сервер отвечал на запрос: за одну
+    секунду проходят десятки строк.
+    """
+    now = time.time()
+    return (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+            + f".{int(now * 1000) % 1000:03d}")
+
+
 class _Tee:
     """
     Подменяет sys.stdout или sys.stderr.
@@ -104,7 +115,7 @@ class _Tee:
             self._pending[key] = lines.pop()       # хвост без перевода строки
             if lines:
                 f = _open_for_today()
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                stamp = _stamp()
                 f.write("".join(f"{stamp} {ln}\n" for ln in lines))
                 f.flush()
         return len(text)
@@ -119,7 +130,7 @@ class _Tee:
             self._pending.clear()
             if rest:
                 f = _open_for_today()
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                stamp = _stamp()
                 f.write("".join(f"{stamp} {ln}\n" for ln in rest))
                 f.flush()
 

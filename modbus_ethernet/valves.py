@@ -73,6 +73,13 @@ VALVE_DIVISOR = 1
 # Подобрать на глаз можно и без приложения:
 #     python3 valves.py --test single --duration 20 --pause 0.25
 TEST_DURATION = 20
+# Сколько раз подряд слать каждый кадр и с какой паузой между копиями.
+# Плата не отвечает по MISO, и потерянный кадр никак не виден: клапан
+# просто не открывается. Повторный кадр с теми же клапанами плате
+# безвреден - она заново открывает те же клапаны на ту же длительность.
+# Подобрать: python3 valves.py --test repeat --copies 2
+FRAME_COPIES = 1
+COPY_GAP = 0.001
 # Через сколько секунд снова пробовать открыть SPI, если не вышло.
 RETRY_SEC = 5.0
 
@@ -82,6 +89,9 @@ INSTALL_HINT = ("модуль spidev не установлен в этот Pytho
 
 
 class ValveBoard:
+    copies = FRAME_COPIES
+    copy_gap = COPY_GAP
+
     def __init__(self, bus=BUS, device=DEVICE, speed=SPEED, mode=MODE,
                  verbose=False):
         if spidev is None:
@@ -141,7 +151,10 @@ class ValveBoard:
         # Передаём копию: xfer2 записывает в переданный список принятые
         # по MISO байты, и в логе вместо отправленного кадра оказывались
         # одни FF.
-        self.spi.xfer2(list(frame))
+        for k in range(max(1, self.copies)):
+            if k:
+                time.sleep(self.copy_gap)
+            self.spi.xfer2(list(frame))
         return frame
 
     def open_valves(self, valves, duration):
@@ -379,6 +392,26 @@ def test_speeds(mode=MODE, duration=2, repeats=300, pause=0.02):
     print("на которой плата перестала отвечать.")
 
 
+def test_repeat(board, valves, duration, pause, count=50):
+    """
+    Один и тот же клапан (или несколько) count раз подряд с паузой pause.
+    Считайте вспышки светодиода: сколько из count пропало и как - вразброс
+    или через равные промежутки. Вразброс - кадры портятся по дороге
+    (провода, земля, уровни); через равные - плата в какие-то моменты
+    занята и не принимает кадр.
+    """
+    print(f"Клапаны {valves}: {count} кадров через {pause} с, "
+          f"duration={duration}, каждый кадр x{board.copies} "
+          f"(пауза между копиями {board.copy_gap * 1000:.1f} мс)")
+    for i in range(count):
+        board.open_valves(valves, duration)
+        if (i + 1) % 10 == 0:
+            print(f"  отправлено {i + 1}")
+        time.sleep(pause)
+    board.close_all()
+    print(f"Готово: отправлено {count}. Сколько вспышек насчитали?")
+
+
 def test_burst(board, count=50, duration=2):
     """
     Пачка кадров подряд без пауз между ними.
@@ -413,8 +446,16 @@ def main():
     p.add_argument("--valves", type=str, default=None,
                    help="номера клапанов через запятую, например 0,5,63")
     p.add_argument("--test", choices=["single", "groups", "edges",
-                                      "speeds", "burst"],
+                                      "speeds", "burst", "repeat"],
                    help="запустить тестовый сценарий")
+    p.add_argument("--copies", type=int, default=FRAME_COPIES,
+                   help=f"сколько раз слать каждый кадр (по умолчанию "
+                        f"{FRAME_COPIES})")
+    p.add_argument("--copy-gap", type=float, default=COPY_GAP,
+                   help=f"пауза между копиями, секунд (по умолчанию "
+                        f"{COPY_GAP})")
+    p.add_argument("--count", type=int, default=50,
+                   help="сколько кадров в тесте repeat (по умолчанию 50)")
     p.add_argument("--off", action="store_true", help="закрыть все клапаны")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="печатать отправляемые байты")
@@ -426,6 +467,8 @@ def main():
 
     with ValveBoard(speed=args.speed, mode=args.mode,
                     verbose=args.verbose) as board:
+        board.copies = args.copies
+        board.copy_gap = args.copy_gap
         actual = board.spi.max_speed_hz
         print(f"SPI: mode={args.mode}, {actual/1e6:.2f} МГц, MSB first")
         if actual != args.speed:
@@ -443,6 +486,10 @@ def main():
             test_groups(board, args.duration)
         elif args.test == "edges":
             test_edges(board, args.duration)
+        elif args.test == "repeat":
+            valves = ([int(x) for x in args.valves.split(",") if x.strip()]
+                      if args.valves else [0])
+            test_repeat(board, valves, args.duration, args.pause, args.count)
         elif args.test == "burst":
             test_burst(board, duration=args.duration)
         elif args.valves:

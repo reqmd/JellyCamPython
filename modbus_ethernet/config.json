@@ -1,0 +1,46 @@
+{
+  "registers": {
+    "camera_type": 41006,
+    "fov_left": 20106,
+    "fov_right": 20107,
+    "valve_count_read": 20108,
+    "valve_base_read": 20109,
+    "valve_count_write": 20237,
+    "valve_base_write": 20238
+  },
+  "device": {
+    "camera_type_value": 10,
+    "valve_max": 128,
+    "fov_margin": 10
+  },
+  "defaults": {
+    "fov_left": 1,
+    "fov_right": 2047,
+    "valve_count": 64
+  },
+  "storage": {
+    "valve_file": "valves.json"
+  },
+  "sorting": {
+    "reject_classes": [
+      "0"
+    ],
+    "mirror_x": true,
+    "save_dir": "crops"
+  },
+  "camera": {
+    "flat_field": true,
+    "flat_target": 156,
+    "flat_per_channel": true,
+    "flat_max_gain": 4.0,
+    "band": [
+      280,
+      1570
+    ],
+    "median": 3,
+    "dark_subtract": true,
+    "ccm": null,
+    "gain": 248,
+    "black_level": 120
+  }
+}

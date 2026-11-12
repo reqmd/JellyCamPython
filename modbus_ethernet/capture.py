@@ -253,7 +253,7 @@ def photo_slice(start: int, count: int):
     offset = start - PHOTO_BASE
     if offset < 0 or offset + count > _packed.size:
         return None
-    return _packed[offset:offset + count].tolist()
+    return _packed[offset:offset + count]       # numpy, без списка
 
 
 def photo_value(addr: int):

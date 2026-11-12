@@ -28,9 +28,9 @@ export LD_LIBRARY_PATH="/opt/ksjapi/arm64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 case "${1:-server}" in
     server)   exec "$PY" dsp_protocol.py "${@:2}" ;;
-    graph)    exec "$PY" line_camera.py --graph ;;
-    camera)   exec "$PY" line_camera.py ;;
-    selftest) exec "$PY" line_camera.py --selftest ;;
+    graph)    exec "$PY" camera_tools.py --graph ;;
+    camera)   exec "$PY" camera_tools.py ;;
+    selftest) exec "$PY" camera_tools.py --selftest ;;
     *)
         echo "не знаю команды '$1'" >&2
         echo "можно: server (по умолчанию), graph, camera, selftest" >&2

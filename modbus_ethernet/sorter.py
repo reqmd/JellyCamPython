@@ -17,7 +17,8 @@
        Предмет отбивают все клапаны, в зону которых он попал.
     5. Клапаны открываются через задержку из регистра 11 после того, как
        передний край предмета прошёл под камерой, на время из регистра 10.
-       Оба регистра в миллисекундах.
+       Задержка - в тактах по 250 мкс (настройка delay_tick_ms): 10 в
+       приложении - это 2,5 мс, 40 - 10 мс. Длительность - в мс.
 
 Регистр 1 с любым значением, кроме 2, останавливает сортировку; метка
 съёмки в 401999 - тоже.
@@ -53,8 +54,8 @@ from valve_config import (CONFIG, HERE, REGISTERS, VALVE_BASE,
 
 COMMAND_REG = 1             # 2 - старт, остальное - стоп
 COMMAND_START = 2
+DELAY_REG = 11              # через сколько после камеры открывать, такты
 DURATION_REG = 10           # сколько держать клапан открытым, мс
-DELAY_REG = 11              # через сколько после камеры открывать, мс
 SHOOT_TAG_REG = 401999      # метка съёмки
 SHOOT_TAG = 65278
 
@@ -81,8 +82,14 @@ SORT_DEFAULTS = {
     "min_confidence": 0.0,
     # Ядро NPU: 0, 1, 2, или -1 - пусть выбирает сам.
     "npu_core": 0,
-    # Сколько миллисекунд в одной единице длительности кадра платы.
-    # Регистр 10 приходит в миллисекундах, в кадр уходит 0..31 единиц.
+    # Длина такта задержки (регистр 11), мс. Приложение задаёт задержку
+    # не в миллисекундах, а в тактах по 250 мкс: 10 - это 2,5 мс.
+    "delay_tick_ms": 0.25,
+    # То же для длительности (регистр 10). Она приходит в миллисекундах.
+    "duration_tick_ms": 1.0,
+    # Сколько миллисекунд в одной единице длительности кадра платы (в
+    # кадр уходит 0..31 единиц). 1.0 - число из регистра 10 уходит в
+    # кадр как есть.
     "ms_per_duration_unit": 1.0,
     # Решение может опоздать: предмет уже пролетел мимо клапанов. Если
     # опоздание меньше этого, клапан открывается сразу; если больше -
@@ -100,10 +107,32 @@ SORT_DEFAULTS = {
     # картинок за одну сортировку.
     "save_dir": "",
     "save_limit": 500,
+    # Где клапаны на снимке ЭТОЙ камеры, столбцы сенсора 0..2047. Пусто -
+    # брать координаты из приложения. Приложение настроено под старую
+    # камеру, и у новой масштаб, сдвиг, а то и направление могут быть
+    # другими - тогда клапаны срабатывают, но соседние. Варианты:
+    #   [x1, xN]        - центр первого и последнего клапана, остальные
+    #                     поровну между ними; x1 > xN, если камера видит
+    #                     ленту зеркально;
+    #   [x1, x2, ... xN] - центр каждого клапана, по номерам.
+    "valve_x": [],
+    # Инверсия позиции предмета: камера видит ленту зеркально - предмет,
+    # пролетающий у правого края, на снимке слева. true - позиция
+    # отражается перед выбором клапана, и предмет под клапаном 1 уходит
+    # клапану 32, под клапаном 2 - клапану 31 и так далее.
+    "mirror_x": False,
+    # Ось отражения, столбец сенсора. null - середина между первым и
+    # последним клапаном: тогда номера клапанов просто идут в обратном
+    # порядке. 1023.5 - середина сенсора.
+    "mirror_center": None,
 }
 
 CFG = dict(SORT_DEFAULTS)
 CFG.update(CONFIG.get("sorting") or {})
+# Имена классов - строки (это имена папок при обучении). Если в настройках
+# записано число, например 0 вместо "0", приводим к строке, иначе класс
+# не совпал бы ни с одним ответом сети и молча не отбивался бы.
+CFG["reject_classes"] = [str(c) for c in (CFG["reject_classes"] or [])]
 
 
 # --------------------------------------------------------------------------
@@ -169,6 +198,16 @@ class Classifier:
             raise RuntimeError("init_runtime не запустил NPU")
         self.model = model
 
+        # Первый вывод после загрузки в разы медленнее остальных: NPU
+        # прогревается. Делаем это сразу, иначе опоздает первый предмет.
+        dummy = np.zeros((1, self.size, self.size, 3), np.uint8)
+        for _ in range(10):
+            self.rknn.inference(inputs=[dummy])
+        t = time.monotonic()
+        for _ in range(20):
+            self.rknn.inference(inputs=[dummy])
+        self.infer_ms = (time.monotonic() - t) / 20 * 1000
+
     def __call__(self, crop_bgr):
         """Вырезка BGR -> (класс, уверенность 0..1)."""
         padded = resize_pad(crop_bgr, self.size)
@@ -194,10 +233,7 @@ def valve_zones():
     наружу на столько же, на сколько к соседу. Индекс - номер клапана в
     приложении минус один.
     """
-    count = int(REGISTERS.get(VALVE_COUNT_REG, 0) or 0)
-    pts = sorted((int(REGISTERS.get(VALVE_BASE + i, 0) or 0), i)
-                 for i in range(count))
-    pts = [p for p in pts if p[0] > 0]
+    pts = sorted(_valve_points()[0])
     zones = []
     for k, (c, i) in enumerate(pts):
         if len(pts) == 1:
@@ -209,6 +245,69 @@ def valve_zones():
                      else c + (c - pts[k - 1][0]) / 2)
         zones.append((left, right, i))
     return zones
+
+
+def _valve_points():
+    """
+    Центры клапанов: ([(x, индекс)], откуда взяты).
+    Из настройки valve_x, если она задана, иначе из приложения.
+    """
+    vx = [float(v) for v in (CFG.get("valve_x") or [])]
+    n = valves.VALVE_COUNT
+    if len(vx) == 2 and n > 1:
+        a, b = vx
+        return ([(a + (b - a) * i / (n - 1), i) for i in range(n)],
+                f"config.json, valve_x {a:g}..{b:g}")
+    if len(vx) > 2:
+        return [(x, i) for i, x in enumerate(vx)], "config.json, valve_x"
+    count = int(REGISTERS.get(VALVE_COUNT_REG, 0) or 0)
+    pts = [(int(REGISTERS.get(VALVE_BASE + i, 0) or 0), i)
+           for i in range(count)]
+    return [p for p in pts if p[0] > 0], "приложение"
+
+
+def _mirror_axis():
+    """Столбец, вокруг которого отражается позиция, или None - без инверсии."""
+    if not CFG.get("mirror_x"):
+        return None
+    if CFG.get("mirror_center") is not None:
+        return float(CFG["mirror_center"])
+    xs = [x for x, _ in _valve_points()[0]]
+    return (min(xs) + max(xs)) / 2 if xs else 1023.5
+
+
+def object_position(obj):
+    """
+    Где предмет для выбора клапана: (x0, x1, описание для лога).
+
+    x0, x1 - столбцы снимка; при инверсии - отражённые. Описание говорит,
+    где предмет на снимке, который видит приложение: столбцы, центр и
+    доля ширины слева направо, и куда он ушёл после инверсии.
+    """
+    import capture
+    x0, x1 = obj["x0"], obj["x1"]
+    c = (x0 + x1) / 2
+    width = getattr(capture, "WIDTH", 2048) or 2048
+    text = (f"на снимке x {x0}..{x1}, {c / width * 100:.0f}% ширины "
+            f"слева")
+    axis = _mirror_axis()
+    if axis is not None:
+        x0, x1 = 2 * axis - x1, 2 * axis - x0
+        text += f", с инверсией x {x0:.0f}..{x1:.0f}"
+    return x0, x1, text
+
+
+def _span(hit):
+    """Клапаны для лога: '3-5', '7' или '-'."""
+    n = _numbers(hit)
+    if not n:
+        return "-"
+    return str(n[0]) if len(n) == 1 else f"{n[0]}-{n[-1]}"
+
+
+def _numbers(hit):
+    """Номера клапанов для лога - как в приложении и в проверке механики."""
+    return [v * valves.VALVE_DIVISOR + valves.VALVE_NUMBER_BASE for v in hit]
 
 
 def board_valve(index):
@@ -272,13 +371,41 @@ class _Stats:
         self.dropped = 0         # очередь переполнена
         self.unknown = 0         # не классифицировано: нет модели
         self.latency = []        # мс от камеры до решения
+        # Из чего складывается задержка, мс:
+        # "буфер камеры" - на сколько позже своего времени камера отдала
+        # строку с передним краем предмета; уже входит в "до детектора".
+        self.parts = {"до детектора": [], "буфер камеры": [], "вырезка": [],
+                      "очередь": [], "сеть": []}
+
+    def short(self):
+        """Сводка в одну короткую строку - для лога каждые summary_sec."""
+        cls = ", ".join(f"класс {k} - {v}"
+                        for k, v in sorted(self.by_class.items()))
+        text = f"предметов {self.seen}" + (f" ({cls})" if cls else "")
+        text += f", отбито {self.rejected}"
+        bad = [f"{name} {val}" for name, val in (
+            ("опоздали и не отбиты", self.too_late),
+            ("вне клапанов", self.no_valve), ("неуверенно", self.low_conf),
+            ("обрезаны краем", self.at_edge), ("потеряны", self.dropped),
+            ("без модели", self.unknown)) if val]
+        if bad:
+            text += ", " + ", ".join(bad)
+        if self.latency:
+            text += f"; решение в среднем через {np.mean(self.latency):.0f} мс"
+        if self.late:
+            text += (f"; {self.late} отбиты позже заданной задержки - "
+                     f"сервер не успел")
+        return text
 
     def line(self):
         cls = ", ".join(f"{k} {v}" for k, v in sorted(self.by_class.items()))
         lat = ""
         if self.latency:
             lat = (f", решение через {np.mean(self.latency):.0f} мс после "
-                   f"камеры (макс {max(self.latency):.0f})")
+                   f"камеры (макс {max(self.latency):.0f}: "
+                   + ", ".join(f"{k} {np.mean(v):.1f}/{max(v):.1f}"
+                               for k, v in self.parts.items() if v)
+                   + " - среднее/макс)")
         extra = [f"{name} {val}" for name, val in (
             ("неуверенно", self.low_conf), ("вне клапанов", self.no_valve),
             ("с опозданием", self.late), ("опоздали, не отбиты", self.too_late),
@@ -286,7 +413,30 @@ class _Stats:
             ("без модели", self.unknown)) if val]
         return (f"предметов {self.seen} ({cls or 'нет'}), отбито "
                 f"{self.rejected}, кадров на плату {self.fired}"
-                + (", " + ", ".join(extra) if extra else "") + lat)
+                + (", " + ", ".join(extra) if extra else "") + lat
+                + self.hint())
+
+    def hint(self):
+        """
+        Если решения опаздывают, сказать прямо, какую задержку ставить.
+
+        Пока задержка меньше времени решения, клапан открывается в момент
+        решения, и менять регистр 11 в этих пределах бесполезно: на ленте
+        ничего не изменится.
+        """
+        if not (self.late or self.too_late) or not self.latency:
+            return ""
+        tick = float(CFG["delay_tick_ms"]) or 1.0
+        # По 95-му проценту, а не по максимуму: один предмет из плотной
+        # пачки, решённый за 100 мс, не должен диктовать задержку всем.
+        p95 = float(np.percentile(self.latency, 95))
+        need = p95 + 2                        # запас на разброс
+        reg = int(-(-need // tick))           # округление вверх
+        return (f". ПОДСКАЗКА: задержка {_delay_ms:g} мс меньше времени "
+                f"решения ({p95:.0f} мс у 95% предметов) - эти клапаны "
+                f"открылись в момент решения, а не по задержке. Чтобы "
+                f"задержка выдерживалась у 95% предметов, нужно "
+                f"~{reg * tick:g} мс, регистр {DELAY_REG} = {reg}")
 
 
 _stats = _Stats()
@@ -304,16 +454,69 @@ def _count(name, n=1):
 # --------------------------------------------------------------------------
 
 def _read_params():
-    """Длительность и задержка из регистров 10 и 11."""
+    """Задержка из регистра 11 и длительность из регистра 10."""
     global _duration_ms, _delay_ms, _units
-    _duration_ms = int(REGISTERS.get(DURATION_REG, 0) or 0)
-    _delay_ms = int(REGISTERS.get(DELAY_REG, 0) or 0)
+    _duration_ms = (int(REGISTERS.get(DURATION_REG, 0) or 0)
+                    * (float(CFG["duration_tick_ms"]) or 1.0))
+    _delay_ms = (int(REGISTERS.get(DELAY_REG, 0) or 0)
+                 * (float(CFG["delay_tick_ms"]) or 1.0))
     per = float(CFG["ms_per_duration_unit"]) or 1.0
     _units = max(1, min(valves.MAX_DURATION, round(_duration_ms / per)))
     if _duration_ms / per > valves.MAX_DURATION:
-        print(f"сортировка: длительность {_duration_ms} мс больше, чем "
+        print(f"сортировка: длительность {_duration_ms:g} мс больше, чем "
               f"помещается в кадр ({valves.MAX_DURATION} единиц по "
               f"{per:g} мс), отправляю {valves.MAX_DURATION}")
+
+
+def _params_text():
+    """Регистры 10 и 11 вместе с тем, сколько это в миллисекундах."""
+    return (f"открывать на {_duration_ms:g} мс (регистр {DURATION_REG} = "
+            f"{REGISTERS.get(DURATION_REG, 0)}, в кадр {_units}), через "
+            f"{_delay_ms:g} мс после камеры (регистр {DELAY_REG} = "
+            f"{REGISTERS.get(DELAY_REG, 0)})")
+
+
+def _check_layout(zones):
+    """
+    Где стоят клапаны и сходится ли их число с платой.
+
+    Раскладку присылает приложение (запись в 20237), сервер хранит её в
+    valves.json. Если приложение настроено на другую машину или другой тип
+    камеры, число и шаг клапанов будут не те - и предметы станут отбиваться
+    не своими клапанами. Снаружи это похоже на "клапаны бьют не туда",
+    поэтому говорим об этом прямо, на старте.
+    """
+    n = len(zones)
+    if not n:
+        print("сортировка: ВНИМАНИЕ - координат клапанов нет, отбивать "
+              "нечем. Пришлите раскладку из приложения")
+        return
+    import line_camera
+    pts, source = _valve_points()
+    xs = sorted(x for x, _ in pts)
+    step = (xs[-1] - xs[0]) / (n - 1) if n > 1 else 0
+    first = min(pts, key=lambda p: p[1])[0]
+    last = max(pts, key=lambda p: p[1])[0]
+    print(f"сортировка: клапаны по координатам ({source}) - {n} шт., "
+          f"клапан 1 на x {first:.0f}, клапан {n} на x {last:.0f}, шаг "
+          f"{step:.1f}; на плате подключено {valves.VALVE_COUNT}; "
+          f"предметы ищутся в столбцах {line_camera.X0}..{line_camera.X1}")
+    axis = _mirror_axis()
+    print("сортировка: инверсия позиции " +
+          ("выключена (mirror_x)" if axis is None else
+           f"ВКЛЮЧЕНА, ось x {axis:.1f}: предмет слева на снимке отбивается "
+           f"клапанами справа"))
+    if n != valves.VALVE_COUNT:
+        print(f"сортировка: ВНИМАНИЕ - приложение прислало {n} клапанов, а "
+              f"на плате {valves.VALVE_COUNT}. Зоны стоят не на своих "
+              f"местах, часть из них ведёт на несуществующие клапаны: "
+              f"предметы будут отбиваться не там или не отбиваться. "
+              f"Проверьте тип камеры и число клапанов в приложении и "
+              f"пришлите раскладку заново")
+    if xs[0] < 0 or xs[-1] > 2047:
+        print(f"сортировка: ВНИМАНИЕ - координаты клапанов выходят за "
+              f"0..2047, то есть за ширину сенсора: в приложении, похоже, "
+              f"выбрана камера с другой матрицей")
 
 
 def _start():
@@ -335,9 +538,9 @@ def _start():
     line_camera.set_object_sink(_on_objects)
 
     zones = valve_zones()
+    _check_layout(zones)
     reject = list(CFG["reject_classes"])
-    print(f"сортировка: старт. Открывать на {_duration_ms} мс (в кадр "
-          f"{_units}), через {_delay_ms} мс после камеры; отбиваем "
+    print(f"сортировка: старт. {_params_text()}; отбиваем "
           f"{reject or 'НИЧЕГО - список reject_classes пуст'}; клапанов с "
           f"координатами {len(zones)}")
     if _classifier_error:
@@ -405,8 +608,7 @@ def on_write(start, values):
         was = (_duration_ms, _delay_ms)
         _read_params()
         if (_duration_ms, _delay_ms) != was:
-            print(f"сортировка: теперь открывать на {_duration_ms} мс, "
-                  f"через {_delay_ms} мс")
+            print(f"сортировка: теперь {_params_text()}")
 
 
 # --------------------------------------------------------------------------
@@ -446,48 +648,70 @@ def _decide(obj, received):
     if _classifier is None:
         _count("unknown")
         return
-    name, conf = _classifier(obj["crop"])
+    crop = obj["crop"]
+    t_nn = time.monotonic()
+    name, conf = _classifier(crop)
+    nn_ms = (time.monotonic() - t_nn) * 1000
     _stats.by_class[name] = _stats.by_class.get(name, 0) + 1
     _total.by_class[name] = _total.by_class.get(name, 0) + 1
-    _save_crop(obj["crop"], name, conf)
+    _save_crop(crop, name, conf)
 
     now = time.monotonic()
     t_front = obj["t_front"] if obj["t_front"] is not None else received
     lat = (now - t_front) * 1000
     _stats.latency.append(lat)
     _total.latency.append(lat)
+    parts = {"сеть": nn_ms, "очередь": (t_nn - received) * 1000}
+    if obj.get("t_found") is not None:
+        parts["до детектора"] = (obj["t_found"] - t_front) * 1000
+        parts["вырезка"] = obj["cut_ms"]
+    if obj.get("cam_lag_ms") is not None:
+        parts["буфер камеры"] = obj["cam_lag_ms"]
+    for k, v in parts.items():
+        _stats.parts[k].append(v)
+        _total.parts[k].append(v)
+
+    # Одна строка на предмет: номер, класс, где он (под какими клапанами)
+    # и что с ним сделано. Подробная позиция на снимке - в конце строки.
+    x0, x1, where = object_position(obj)
+    hit = valves_for(x0, x1, valve_zones())
+    head = (f"предмет {_total.seen}: класс {name} ({conf:.2f}), "
+            f"под клапанами {_span(hit)}")
+    tail = f"   [{where}]"
+
+    def say(text):
+        if CFG["log_each"]:
+            print(f"{head} - {text}{tail}")
 
     if name not in CFG["reject_classes"]:
+        say("не отбиваем")
         return
     if conf < float(CFG["min_confidence"]):
         _count("low_conf")
+        say(f"не отбит: сеть не уверена (порог {CFG['min_confidence']})")
         return
-    hit = valves_for(obj["x0"], obj["x1"], valve_zones())
     if not hit:
         _count("no_valve")
-        if CFG["log_each"]:
-            print(f"сортировка: {name} {conf:.2f} на x {obj['x0']}..."
-                  f"{obj['x1']} - вне зон клапанов, отбить нечем")
+        say("не отбит: вне зон клапанов")
         return
 
     due = t_front + _delay_ms / 1000
     wait = (due - now) * 1000
     if wait < -float(CFG["late_limit_ms"]):
         _count("too_late")
-        if CFG["log_each"]:
-            print(f"сортировка: {name} {conf:.2f} - решение опоздало на "
-                  f"{-wait:.0f} мс, предмет уже пролетел; увеличьте "
-                  f"задержку (регистр {DELAY_REG}) или проверьте нагрузку")
+        say(f"НЕ ОТБИТ: решение через {lat:.0f} мс, а задержка "
+            f"{_delay_ms:g} мс - предмет уже пролетел")
         return
-    if wait < 0:
-        _count("late")
     _count("rejected")
     with _lock:
         heapq.heappush(_events, (due, next(_seq), hit, _units, _session))
         _events_cv.notify()
-    if CFG["log_each"]:
-        print(f"сортировка: {name} {conf:.2f} на x {obj['x0']}..."
-              f"{obj['x1']} -> клапаны {hit} через {max(wait, 0):.0f} мс")
+    if wait < 0:
+        _count("late")
+        say(f"ОТБИТ ПОЗЖЕ: через {lat:.0f} мс после камеры вместо "
+            f"{_delay_ms:g}")
+    else:
+        say(f"отбит через {_delay_ms:g} мс после камеры")
 
 
 def _worker():
@@ -497,7 +721,7 @@ def _worker():
         _classifier = Classifier()
         print(f"сортировка: модель {_classifier.model}, классы "
               f"{_classifier.classes}, вход {_classifier.size}x"
-              f"{_classifier.size}")
+              f"{_classifier.size}, вывод {_classifier.infer_ms:.1f} мс")
     except Exception as e:
         _classifier_error = str(e) or type(e).__name__
         print(f"сортировка: сеть недоступна - {_classifier_error}")
@@ -517,8 +741,8 @@ def _worker():
         now = time.monotonic()
         if now - _summary_at >= float(CFG["summary_sec"]):
             if _active and _stats.seen:
-                print(f"сортировка за {now - _summary_at:.0f} с: "
-                      f"{_stats.line()}")
+                print(f"сводка за {now - _summary_at:.0f} с: "
+                      f"{_stats.short()}")
             _stats.reset()
             _summary_at = now
 

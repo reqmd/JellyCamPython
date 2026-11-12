@@ -15,7 +15,10 @@ import errno
 import socket
 import traceback
 import struct
+import sys
 import time
+
+import numpy as np
 
 import capture
 import valves
@@ -66,13 +69,28 @@ MAX_READ_REGS = max(30000, capture.WIDTH * capture.MAX_HEIGHT
 # 0 - слать без пауз. Если видны потери, начните с 0.0002.
 FRAME_DELAY = 0.0
 
-# Чтения, которые не печатаются: регистр 99 - статус, приложение спрашивает
-# его несколько раз в секунду, и лог разрастался в основном из-за него.
-# Вместо каждой строки раз в QUIET_SUMMARY_SEC печатается одна сводка -
-# по ней видно, что приложение на связи. Пустое множество - печатать всё.
-QUIET_READ_REGS = {99}
+# Запросы, на которые сервер ответил дольше, печатаются с временем - так
+# в логе видно, где сервер тормозит. Ответ из многих фрагментов (снимок)
+# печатается с временем всегда.
+SLOW_REPLY_MS = 50
+TIMED_FRAMES = 100
+
+# Приложение шлёт каждый запрос дважды подряд. Для снимка это значит два
+# потока по 2161 фрагменту: второй идёт, пока приложение уже разбирает
+# первый и перезапрашивает потерянные куски, и забивает канал. Повтор того
+# же самого большого чтения в течение этого времени после конца ответа
+# не отправляем. 0 - отвечать на каждый.
+DUP_BIG_READ_SEC = 1.0
+_last_big = (None, 0.0)          # (байты запроса, когда ушёл ответ)
+
+# Чтения, которые не печатаются: приложение спрашивает их по нескольку раз
+# в секунду (99 - статус всегда, 69 и 41090 - во время сортировки), и лог
+# состоял в основном из них. Вместо каждой строки раз в QUIET_SUMMARY_SEC
+# печатается одна сводка - по ней видно, что приложение на связи.
+# Пустое множество - печатать всё.
+QUIET_READ_REGS = {99, 69, 41090}
 QUIET_SUMMARY_SEC = 60
-_quiet_count = 0
+_quiet_count = {}
 _quiet_since = time.monotonic()
 
 # --------------------------------------------------------------------------
@@ -163,12 +181,58 @@ def _make_crc_table():
 _CRC_TABLE = _make_crc_table()
 
 
+_CRC_NP = np.array(_CRC_TABLE, dtype=np.uint16)
+
+# Длинные кадры считаются через numpy, короткие - циклом: на десятке байт
+# цикл быстрее, чем подготовка массивов.
+CRC_NUMPY_FROM = 64
+
+# Для каждой длины кадра: (вклад начального 0xFFFF, таблица вкладов
+# байтов по позициям, номера позиций). Длин всего несколько - полный
+# фрагмент 728 регистров, хвост снимка, график.
+_crc_pos_cache = {}
+
+
+def _crc_tables(n):
+    """
+    CRC линейна: CRC кадра - это XOR вкладов каждого байта на своём месте
+    и вклада начального значения. Вклад байта b на позиции i - это CRC
+    байта b, за которым идут n - 1 - i нулевых байтов. Считаем такие
+    таблицы один раз на длину и потом получаем CRC одним XOR по массиву,
+    без цикла Python по полутора тысячам байтов.
+    """
+    t = _crc_pos_cache.get(n)
+    if t is not None:
+        return t
+    pos = np.empty((n, 256), dtype=np.uint16)
+    cur = _CRC_NP.copy()                  # байт на последнем месте
+    pos[n - 1] = cur
+    for i in range(n - 2, -1, -1):        # ещё один нулевой байт после
+        cur = (cur >> 8) ^ _CRC_NP[cur & 0xFF]
+        pos[i] = cur
+    init = 0xFFFF
+    for _ in range(n):
+        init = (init >> 8) ^ _CRC_TABLE[init & 0xFF]
+    t = (init, pos, np.arange(n))
+    if len(_crc_pos_cache) > 32:          # мусорные длины не копим
+        _crc_pos_cache.clear()
+    _crc_pos_cache[n] = t
+    return t
+
+
 def crc16(data: bytes) -> int:
     """
     CRC-16/MODBUS, в кадре идёт старшим байтом вперёд.
-    Считается по таблице: на передачу снимка приходится больше трёх
-    мегабайт, и побитовый вариант там становится заметен.
+
+    На передачу снимка приходится больше трёх мегабайт. Побайтовый цикл
+    Python тратил на них около секунды процессора, и всё это время
+    сервер отвечал медленно, а приложение начинало перезапрашивать куски
+    снимка поштучно. Длинные кадры теперь считаются через numpy.
     """
+    if len(data) >= CRC_NUMPY_FROM:
+        init, pos, idx = _crc_tables(len(data))
+        b = np.frombuffer(data, dtype=np.uint8)
+        return int(init ^ np.bitwise_xor.reduce(pos[idx, b]))
     crc = 0xFFFF
     for b in data:
         crc = (crc >> 8) ^ _CRC_TABLE[(crc ^ b) & 0xFF]
@@ -201,7 +265,7 @@ def graph_slice(start: int, count: int):
             continue
         offset = start - base
         if 0 <= offset and offset + count <= data.size:
-            return data[offset:offset + count].tolist()
+            return data[offset:offset + count]
     return None
 
 
@@ -222,7 +286,10 @@ def build_read_frame(start: int, count: int, last: bool) -> bytes:
         values = [register_value(start + i, shift) for i in range(count)]
     frame = bytes([UNIT, 1 if last else 0, FUNC_READ, DSP_STATE])
     frame += struct.pack(">II", start, count)
-    frame += struct.pack(f">{count}H", *values)
+    if isinstance(values, np.ndarray):
+        frame += values.astype(">u2").tobytes()
+    else:
+        frame += struct.pack(f">{count}H", *values)
     return with_crc(frame)
 
 
@@ -259,16 +326,17 @@ def build_write_response(start: int, count: int) -> bytes:
 # Обработка запроса
 # --------------------------------------------------------------------------
 
-def quiet_read():
+def quiet_read(start):
     """Учесть тихое чтение; раз в QUIET_SUMMARY_SEC напечатать сводку."""
     global _quiet_count, _quiet_since
-    _quiet_count += 1
+    _quiet_count[start] = _quiet_count.get(start, 0) + 1
     now = time.monotonic()
     if now - _quiet_since >= QUIET_SUMMARY_SEC:
-        regs = ", ".join(str(r) for r in sorted(QUIET_READ_REGS))
-        print(f"статус: регистр {regs} запрошен {_quiet_count} раз "
-              f"за {now - _quiet_since:.0f} с")
-        _quiet_count = 0
+        sec = now - _quiet_since
+        regs = ", ".join(f"{r} - {n} ({n / sec:.1f}/с)"
+                         for r, n in sorted(_quiet_count.items()))
+        print(f"статус: за {sec:.0f} с запрошены регистры {regs}")
+        _quiet_count = {}
         _quiet_since = now
 
 
@@ -291,8 +359,8 @@ def handle(data: bytes):
             print(f"чтение: регистр {start}, количество {count} -- "
                   f"вне допустимого (1..{MAX_READ_REGS}), игнорирую")
             return []
-        if count == 1 and start in QUIET_READ_REGS:
-            quiet_read()
+        if start in QUIET_READ_REGS and count <= 8:
+            quiet_read(start)
             return iter_read_frames(start, count)
         per = MAX_REGS_PER_FRAME or count
         parts = -(-count // per)          # округление вверх
@@ -383,8 +451,18 @@ def main():
           f"поле зрения {REGISTERS[FOV_LEFT_REG]}..{REGISTERS[FOV_RIGHT_REG]}, "
           f"клапанов {REGISTERS[VALVE_COUNT_REG]}")
 
+    # Python отдаёт процессор между потоками раз в 5 мс. Пока потоки
+    # камеры и сортировки считают, главный поток после каждой отправки
+    # датаграммы мог ждать своей очереди до 5 мс - на снимке из 2161
+    # фрагмента это складывается в секунды. 1 мс - сервер отвечает быстрее,
+    # камере это почти ничего не стоит.
+    sys.setswitchinterval(0.001)
+
     while True:
         data, addr = sock.recvfrom(65535)
+        t_recv = time.perf_counter()
+        if _skip_duplicate(data, t_recv):
+            continue
         # Одна неудачная обработка не должна останавливать сервер. Раньше
         # любое исключение - в разборе, в сборке ответа или в отправке -
         # завершало программу, и сервер переставал отвечать совсем.
@@ -392,15 +470,57 @@ def main():
         # сервер ждёт следующий запрос.
         try:
             first = True
+            frames = 0
+            t_first = None
             for frame in handle(data):
                 if FRAME_DELAY and not first:
                     time.sleep(FRAME_DELAY)
                 send(sock, frame, addr)
+                if first:
+                    t_first = time.perf_counter()
                 first = False
+                frames += 1
+            _report_time(data, frames, t_recv, t_first)
         except Exception:
             print(f"ОШИБКА при обработке запроса от {addr[0]}:{addr[1]}, "
                   f"{len(data)} байт: {data[:16].hex()}")
             traceback.print_exc()
+
+
+def _is_big_read(data):
+    if len(data) < 13 or data[2] != FUNC_READ:
+        return False
+    count = struct.unpack(">I", data[7:11])[0]
+    return count > MAX_REGS_PER_FRAME * TIMED_FRAMES
+
+
+def _skip_duplicate(data, now):
+    """True - это повтор большого чтения, на которое только что ответили."""
+    if not DUP_BIG_READ_SEC or not _is_big_read(data):
+        return False
+    prev, when = _last_big
+    if data == prev and now - when < DUP_BIG_READ_SEC:
+        start = struct.unpack(">I", data[3:7])[0]
+        print(f"чтение: регистр {start} - повтор того же запроса через "
+              f"{(now - when) * 1000:.0f} мс после ответа, второй раз не шлю")
+        return True
+    return False
+
+
+def _report_time(data, frames, t_recv, t_first):
+    """Сколько занял ответ, если он долгий или большой."""
+    global _last_big
+    now = time.perf_counter()
+    total = (now - t_recv) * 1000
+    if _is_big_read(data):
+        _last_big = (data, now)
+    if frames < TIMED_FRAMES and total < SLOW_REPLY_MS:
+        return
+    start = struct.unpack(">I", data[3:7])[0] if len(data) >= 7 else -1
+    first = (t_first - t_recv) * 1000 if t_first else total
+    print(f"  ответ на регистр {start}: {frames} фрагм. за {total:.0f} мс, "
+          f"первый через {first:.1f} мс"
+          f"{'  <- МЕДЛЕННО' if frames < TIMED_FRAMES else ''}")
 
 
 def send(sock, frame, addr):
