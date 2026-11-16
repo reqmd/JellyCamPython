@@ -26,21 +26,21 @@
       "0"
     ],
     "mirror_x": true,
-    "save_dir": "crops"
+    "save_dir": ""
   },
   "camera": {
     "flat_field": true,
     "flat_target": 156,
     "flat_per_channel": true,
-    "flat_max_gain": 4.0,
+    "flat_max_gain": 16.0,
     "band": [
       280,
       1570
     ],
     "median": 3,
-    "dark_subtract": true,
+    "dark_subtract": false,
     "ccm": null,
-    "gain": 248,
-    "black_level": 120
+    "gain": 200,
+    "black_level": null
   }
 }

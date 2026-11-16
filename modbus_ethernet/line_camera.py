@@ -56,11 +56,11 @@ else:
 IDX = 0
 SENSOR_WIDTH = 2048
 SENSOR_ROWS = 2             # физических ряда у сенсора Awaiba
-LINES = 8                   # считываний сенсора в порции: 4 мс при 2000
+LINES = 2                   # считываний сенсора в порции: 4 мс при 2000
 # Выдержка строки, мс. Предел - меньше половины периода считывания
 # (оба ряда сенсора экспонируются по очереди): при 2000 в секунду это
 # до 0.24 мс, при 4000 - до 0.12. Проверка: --exposure-sweep.
-EXPOSURE_MS = 0.1
+EXPOSURE_MS = 0.225
 TRIGGER_MODE = 3            # 3 = фиксированная частота строк
 # Считываний в секунду. Рабочее значение машины - 2000 (при выдержке
 # 0.225 мс 4000 камера не держит). Больше 4000 эта камера не держит: при 8000 порция
@@ -68,7 +68,7 @@ TRIGGER_MODE = 3            # 3 = фиксированная частота ст
 # кусок ленты между порциями пропадает целиком. Предметы на стыках порций
 # от этого и резались. Проверено gapcheck.py --sweep: при 4000 и 3000 цикл
 # совпадает с расчётом, при 6000 и 8000 он ровно вдвое длиннее.
-FIXED_RATE = 4000.0
+FIXED_RATE = 2000.0
 # Усиление сегментов сенсора, как его принимает KSJ_AWAIBA_SetGain:
 # 0..255, больше - ярче (проверено перебором: 0 - лента около 135, 200 -
 # в 255). Читается обратно оно перевёрнутым: KSJ_AWAIBA_GetGain отдаёт
@@ -77,6 +77,15 @@ FIXED_RATE = 4000.0
 # Подбор: python3 camera_tools.py --gain-sweep.
 GAIN = 200
 
+STREAM_TRACKING = True # Если истинно, применяется отдельный модуль детекции 
+# который находится в stream_detector.py
+
+# Максимальный горизонтальный зазор
+# для объединения близких интервалов
+STREAM_LINK_X = 10
+
+# Минимальная длина интервала в пикселях
+STREAM_MIN_RUN = 3
 
 def _gain_to_sdk(gain):
     """Усиление из настроек -> значение для KSJ_AWAIBA_SetGain."""
@@ -190,12 +199,11 @@ BG_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # предмета не разрывала его надвое. Серия становится предметом, если она
 # не короче MIN_ROWS строк, набрала MIN_AREA пикселей и не задела края
 # полосы (EDGE_OLD столбцов с каждой стороны).
-MIN_ROW_PIXELS = 10
-GAP_ROWS = 6
-MIN_ROWS = 3
-TH = 15                     # порог отличия от фона
-MIN_AREA = 400              # пикселей в серии
-
+MIN_ROW_PIXELS = 25
+GAP_ROWS = 3
+MIN_ROWS = 6
+TH = 15
+MIN_AREA = 400
 # Вырезка предметов для сортировки. Маска строится так же, как в
 # capture_simple.py, на котором набирались картинки для обучения: отличие
 # от фона, открытие ядром OPEN_K (убрать одиночные точки), замыкание
@@ -238,7 +246,7 @@ QUEUE_SIZE = 64
 # 1000 порций в секунду он не тянет. Поэтому захват склеивает подряд
 # идущие порции в блок не меньше PROC_ROWS строк. Задержка решения от
 # этого та же, что при порции такого размера.
-PROC_ROWS = 16
+PROC_ROWS = LINES * 2
 
 # Порций, выбрасываемых сразу после открытия камеры: первые кадры она
 # отдаёт неустоявшимися. Одной хватает с запасом, берём четыре - это
@@ -471,36 +479,99 @@ class ObjectDetector:
                 self.gap += 1
                 if self.gap >= GAP_ROWS:
                     self._close()
-
+        # Диагностика активной серии
+        if self.run_lo is not None:
+        
+            run_len = self.run_hi - self.run_lo
+        
+            now = time.monotonic()
+        
+            if now - getattr(self, "_debug_at", 0) > 0.5:
+        
+                self._debug_at = now
+        
+                print(
+                    f"DEBUG: "
+                    f"busy={busy.mean():.0%}, "
+                    f"max_pixels={counts.max()}, "
+                    f"run_len={run_len}, "
+                    f"run_area={self.run_px}, "
+                    f"edge={self.run_edge}, "
+                    f"gap={self.gap}, "
+                    f"pending={len(self.pending)}",
+                    flush=True
+                )
         return self._ready()
 
+    
     def _close(self, force=False):
         """Серия кончилась - решаем, предмет это или шум."""
+    
         if self.run_lo is None:
             return
-        lo, hi, px, edge = self.run_lo, self.run_hi, self.run_px, self.run_edge
+    
+        lo, hi, px, edge = (
+            self.run_lo,
+            self.run_hi,
+            self.run_px,
+            self.run_edge
+        )
+    
         self.run_lo = self.run_hi = None
         self.run_px = 0
         self.run_edge = False
         self.gap = 0
-        if force or hi - lo < MIN_ROWS or px < MIN_AREA:
+    
+        # Диагностика причин отбрасывания
+        if force:
             self.rejected += 1
+    
+            print(
+                f"ОТСЕЯНО: разрыв потока, "
+                f"строк={hi - lo}"
+            )
             return
-        # Сортировке серия нужна, даже если задела край полосы: предметы
-        # у края отсеиваются поштучно при вырезке, а остальные в той же
-        # серии сортируются как обычно.
+    
+        if hi - lo < MIN_ROWS:
+            self.rejected += 1
+    
+            print(
+                f"ОТСЕЯНО: мало строк, "
+                f"{hi - lo} < {MIN_ROWS}"
+            )
+            return
+    
+        if px < MIN_AREA:
+            self.rejected += 1
+    
+            print(
+                f"ОТСЕЯНО: малая площадь, "
+                f"{px} < {MIN_AREA}"
+            )
+            return
+    
+        # Рабочая сортировка остается без изменений
         if self.on_run is not None:
             self.on_run(lo, hi)
+    
         if not self.frames_enabled:
-            # Идёт сортировка: кадр для снимка никому не нужен, а его сборка
-            # (подмена соседей фоном, медианы) занимает поток детекции на
-            # несколько миллисекунд и задерживает решение по следующим
-            # предметам.
             return
+    
+        # В режиме съёмки не отбрасываем весь кадр,
+        # если один из объектов задел край полосы.
         if edge:
-            self.rejected += 1
-            return
+            print(
+                f"СЕРИЯ ЗАДЕЛА КРАЙ: "
+                f"строк={hi - lo}, площадь={px}"
+            )
+    
+        print(
+            f"СЕРИЯ ПРИНЯТА: "
+            f"строк={hi - lo}, площадь={px}"
+        )
+    
         self.pending.append((lo, hi))
+
 
     # --- выдача кадра ---------------------------------------------------
 
@@ -1046,8 +1117,22 @@ class LineCamera:
                           f"увеличьте LINES или уменьшите FIXED_RATE")
 
     def _detector(self, background):
-        det = ObjectDetector(background, self.chunk_rows,
-                             getattr(self, "bg_rows", None))
+        if STREAM_TRACKING:
+            from stream_detector import make_stream_detector
+    
+            detector_cls = make_stream_detector(
+                ObjectDetector,
+                globals()
+            )
+        else:
+            detector_cls = ObjectDetector
+    
+        det = detector_cls(
+            background,
+            self.chunk_rows,
+            getattr(self, "bg_rows", None)
+        )
+    
         self.detector = det
         print(f"  буфер {det.buf_pieces} порций = "
               f"{det.buf_pieces * self.chunk_rows} строк "
@@ -1072,7 +1157,10 @@ class LineCamera:
             self._update_graph(piece)
             det.frames_enabled = _object_sink is None
             if not _detect_enabled:
-                continue            # калибровка: детекция не нужна
+                if getattr(det, "_stream_mode", False):
+                    det.reset_stream()
+            
+                continue
 
             for frame in det.feed(piece, t_end, lag):
                 self.objects += 1
