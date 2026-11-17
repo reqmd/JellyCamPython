@@ -135,6 +135,10 @@ LOG_OBJECTS = bool(LOG_CFG.get("log_objects", CFG["log_each"]))
 LOG_SUMMARY = bool(LOG_CFG.get("log_summary", True))
 SUMMARY_SEC = max(0.1, float(LOG_CFG.get("summary_sec", CFG["summary_sec"])))
 LOG_POSITIONS = bool(LOG_CFG.get("log_positions", False))
+NPU_WARN_MS = float(LOG_CFG.get("npu_warn_ms", 5.0))
+NPU_DETAIL_EACH = bool(LOG_CFG.get("npu_detail_each", False))
+PIPELINE_TIMING = bool(LOG_CFG.get("pipeline_timing", True))
+PIPELINE_TIMING_EACH = bool(LOG_CFG.get("pipeline_timing_each", True))
 # Имена классов - строки (это имена папок при обучении). Если в настройках
 # записано число, например 0 вместо "0", приводим к строке, иначе класс
 # не совпал бы ни с одним ответом сети и молча не отбивался бы.
@@ -214,17 +218,39 @@ class Classifier:
             self.rknn.inference(inputs=[dummy])
         self.infer_ms = (time.monotonic() - t) / 20 * 1000
 
-    def __call__(self, crop_bgr):
-        """Вырезка BGR -> (класс, уверенность 0..1)."""
+    def classify_timed(self, crop_bgr):
+        """(class, confidence, timings): preparation / RKNN / result, ms.
+
+        `thread_cpu_ms` measures CPU consumption by this Python thread,
+        while `rknn_ms` measures elapsed wall time, including waits in the
+        driver. Their difference is only a diagnostic clue, not proof of
+        which device or lock caused a long call.
+        """
+        start = time.perf_counter_ns()
         padded = resize_pad(crop_bgr, self.size)
         rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        # В NPU идёт uint8 без деления на 255: нормализацию делает сам
-        # NPU по mean/std, заданным при сборке модели.
-        out = self.rknn.inference(inputs=[np.expand_dims(rgb, 0)])
+        inp = np.expand_dims(rgb, 0)
+        before_rknn = time.perf_counter_ns()
+        cpu_before = time.thread_time_ns()
+        out = self.rknn.inference(inputs=[inp])
+        cpu_after = time.thread_time_ns()
+        after_rknn = time.perf_counter_ns()
         logits = np.asarray(out[0], dtype=np.float64).ravel()
         idx = int(np.argmax(logits))
         e = np.exp(logits - logits.max())
-        return self.classes[idx], float(e[idx] / e.sum())
+        confidence = float(e[idx] / e.sum())
+        end = time.perf_counter_ns()
+        return (self.classes[idx], confidence, {
+            'Подг': (before_rknn-start) / 1e6,
+            'RKNN': (after_rknn-before_rknn) / 1e6,
+            'Рез': (end-after_rknn) / 1e6,
+            'RKNN_CPU': (cpu_after-cpu_before) / 1e6,
+        })
+
+    def __call__(self, crop_bgr):
+        """Compatibility with existing callers."""
+        name, conf, _ = self.classify_timed(crop_bgr)
+        return name, conf
 
 
 # --------------------------------------------------------------------------
@@ -351,6 +377,7 @@ _units = 1                   # длительность в единицах пл
 _saved = 0
 _started_at = None
 _camera_base = None
+_pipeline_previous = None
 _logger_base = 0
 _spi_inflight = 0
 
@@ -385,7 +412,7 @@ class _Stats:
         self.errors = 0
         self.no_time = 0
         self.latency = []
-        self.parts = {k: [] for k in ("Сбор", "Дет", "Выр", "Оч", "NPU", "Проч")}
+        self.parts = {k: [] for k in ("Сбор", "Дет", "КамОч", "КамОчЗак", "Возраст", "ВозрастЗак", "Сним", "СнимCPU", "ВырОч", "Выр", "Оч", "NPU", "Подг", "RKNN", "Рез", "Проч")}
         self.spi_late = []      # отклонение начала вызова SPI от due, со знаком
 
     def short(self):
@@ -458,6 +485,16 @@ def _camera_summary(before, after):
     text = (f"  Камера: порций={delta('grabbed')} потери={delta('dropped')} "
             f"разрывы={delta('gaps')} восстановлений={delta('recoveries')} "
             f"ошибки вырезки={delta('sort_errors')} очередь={after['queue']}")
+    if after.get('cut_async'):
+        ncut = delta('cut_wait_n')
+        wms = delta('cut_wait_sum_ms')
+        text += (f"\n  ВЫРЕЗАНИЕ: принято={delta('cut_enqueued')} "
+                 f"готово={delta('cut_completed')} "
+                 f"резервных={delta('cut_queue_full')} "
+                 f"в очереди={after.get('cut_queue', 0)} "
+                 f"макс очередь={after.get('cut_pending_max', 0)} "
+                 f"ожидание сред={wms/ncut if ncut else 0:.2f} мс "
+                 f"макс={after.get('cut_wait_max_ms', 0):.2f} мс")
     if "stream_pieces" in after:
         n = delta('stream_pieces')
         text += (f"\n  STREAM: завершено={delta('stream_finished')} "
@@ -467,7 +504,50 @@ def _camera_summary(before, after):
         if n > 0:
             text += (f" | маска={delta('stream_mask_ns')/n/1e6:.3f} "
                      f"трек={delta('stream_track_ns')/n/1e6:.3f} мс/порция")
+    if after.get('pipeline_timing'):
+        text += "\n" + _pipeline_summary(before, after)
     return prefix + text
+
+
+def _pipeline_summary(before, after):
+    """Compact stage costs. Maxima are since session start, averages are deltas.
+
+    Counters are single-writer and sampled without interrupting the detector.
+    Per-stage timings may overlap: CPU is a subset of wall STREAM time,
+    and mask/track/callback are subsets of STREAM wall time.
+    """
+    if not after or not after.get('pipeline_timing'):
+        return ''
+    before = before or {}
+    def mean(stage):
+        count = after.get(stage+'_n', 0) - before.get(stage+'_n', 0)
+        ns = after.get(stage+'_sum_ns', 0) - before.get(stage+'_sum_ns', 0)
+        return ns / count / 1e6 if count > 0 else 0.0
+    def maxval(stage):
+        return after.get(stage+'_max_ns', 0) / 1e6
+    def fmt(stage):
+        return f'{mean(stage):.2f}/{maxval(stage):.2f}'
+    pieces = after.get('stream_pieces', 0) - before.get('stream_pieces', 0)
+    if pieces > 0:
+        mask = (after.get('stream_mask_ns', 0) - before.get('stream_mask_ns', 0)) / pieces / 1e6
+        track = (after.get('stream_track_ns', 0) - before.get('stream_track_ns', 0)) / pieces / 1e6
+    else:
+        mask = track = 0.0
+    ncb = after.get('stream_onrun_n', 0) - before.get('stream_onrun_n', 0)
+    cb = ((after.get('stream_onrun_sum_ns', 0) - before.get('stream_onrun_sum_ns', 0))
+          / ncb / 1e6 if ncb else 0.0)
+    nsnap = after.get('snapshot_n', 0) - before.get('snapshot_n', 0)
+    snap = ((after.get('snapshot_sum_ns', 0) - before.get('snapshot_sum_ns', 0))
+            / nsnap / 1e6 if nsnap else 0.0)
+    return (f'  ПРОФИЛЬ мс сред/макс*: ОчКам={fmt("cam_queue")} '
+            f'Возраст={fmt("cam_age")} Граф={fmt("graph")} '
+            f'STREAM={fmt("feed")} CPU={fmt("feed_cpu")} '
+            f'буферОчМакс={after.get("pipeline_pending_max", 0)}\n'
+            f'  STREAM мс: Маска={mask:.3f}/{after.get("stream_mask_max_ns", 0)/1e6:.3f} '
+            f'Трек={track:.3f}/{after.get("stream_track_max_ns", 0)/1e6:.3f} '
+            f'Колбэк={cb:.3f}/{after.get("stream_onrun_max_ns", 0)/1e6:.3f} '
+            f'Сним={snap:.3f}/{after.get("snapshot_max_ns", 0)/1e6:.3f} '
+            f'(колбэков={ncb}, снимков={nsnap}; *макс с начала сессии)')
 
 
 # --------------------------------------------------------------------------
@@ -542,7 +622,7 @@ def _check_layout(zones):
 
 
 def _start():
-    global _active, _session, _saved, _started_at, _camera_base, _logger_base, _summary_at, _stats, _total
+    global _active, _session, _saved, _started_at, _camera_base, _pipeline_previous, _logger_base, _summary_at, _stats, _total
     import capture
     import line_camera
     if capture.MODE != capture.MODE_LINE_CAMERA:
@@ -558,7 +638,10 @@ def _start():
         _stats = _Stats()
         _total = _Stats()
         _started_at = _summary_at = time.monotonic()
+        if PIPELINE_TIMING:
+            line_camera.reset_sorting_profile()
         _camera_base = line_camera.sorting_metrics()
+        _pipeline_previous = _camera_base
         _logger_base = logger.dropped_count()
         _active = True
     session = _session
@@ -570,6 +653,10 @@ def _start():
           f"LINES={line_camera.LINES} PROC_ROWS={line_camera.PROC_ROWS} | "
           f"задано {line_camera.ROWS_PER_SEC:g} строк/с | "
           f"выдержка={line_camera.EXPOSURE_MS:g} мс")
+    print(f"  Вырезание: {'поток + очередь' if (line_camera.CUT_ASYNC and line_camera.STREAM_TRACKING) else 'синхронно'} | "
+          f"очередь={line_camera.CUT_QUEUE_SIZE} | "
+          f"NPU-предупреждение от {NPU_WARN_MS:g} мс | "
+          f"профиль стадий={'ON' if PIPELINE_TIMING else 'OFF'}")
     print(f"  Детектор: {'STREAM' if line_camera.STREAM_TRACKING else 'SERIES'} | "
           f"ROI={line_camera.X0}..{line_camera.X1} TH={line_camera.TH} "
           f"GAP={line_camera.GAP_ROWS} MIN_ROWS={line_camera.MIN_ROWS} MIN_AREA={line_camera.MIN_AREA} "
@@ -723,9 +810,19 @@ def _decide(obj, received, session):
             return
     crop = obj["crop"]
     t_nn = time.monotonic()
-    name, conf = model(crop)
+    if hasattr(model, 'classify_timed'):
+        name, conf, npu_detail = model.classify_timed(crop)
+    else:
+        name, conf = model(crop)
+        npu_detail = {}
     t_nn_end = time.monotonic()
     nn_ms = (t_nn_end - t_nn) * 1000
+    if nn_ms >= NPU_WARN_MS:
+        print(f'  NPU ДОЛГО: {nn_ms:.2f} мс | '
+              f'подготовка={npu_detail.get("Подг", 0):.2f} '
+              f'RKNN={npu_detail.get("RKNN", nn_ms):.2f} '
+              f'результат={npu_detail.get("Рез", 0):.2f} '
+              f'CPU в RKNN={npu_detail.get("RKNN_CPU", 0):.2f} мс')
     _save_crop(crop, name, conf)
 
     # Срок по-прежнему отсчитывается от t_front. Измеряем решение
@@ -736,8 +833,22 @@ def _decide(obj, received, session):
     t_found = obj.get("t_found")
     cut_end = obj.get("t_cut_end")
     parts = {"NPU": nn_ms, "Оч": (t_nn - (cut_end if cut_end is not None else received)) * 1000}
+    parts.update({k: npu_detail[k] for k in ("Подг", "RKNN", "Рез") if k in npu_detail})
     if obj.get("cut_ms") is not None:
         parts["Выр"] = obj["cut_ms"]
+    if obj.get("cut_wait_ms") is not None:
+        parts["ВырОч"] = obj['cut_wait_ms']
+    if PIPELINE_TIMING:
+        # Do not shadow `name`: it is the RKNN class label used to decide
+        # whether the object must be rejected by the valves.
+        for metric_name, key in (("КамОч", "camera_queue_ms"),
+                                 ("КамОчЗак", "camera_finish_queue_ms"),
+                                 ("Возраст", "camera_age_ms"),
+                                 ("ВозрастЗак", "camera_finish_age_ms"),
+                                 ("Сним", "snapshot_ms"),
+                                 ("СнимCPU", "snapshot_cpu_ms")):
+            if obj.get(key) is not None:
+                parts[metric_name] = obj[key]
     if actual_front is not None and t_last is not None:
         parts["Сбор"] = (t_last - actual_front) * 1000
         if t_found is not None:
@@ -751,7 +862,10 @@ def _decide(obj, received, session):
         now = time.monotonic()
         lat = (now - t_front) * 1000
         if actual_front is not None and all(k in parts for k in ("Сбор", "Дет", "Выр", "Оч", "NPU")):
-            parts["Проч"] = lat - sum(parts.values())
+            # The detailed NPU stages are a *breakdown* of NPU, not extra
+            # elapsed time; do not subtract them twice from the residual.
+            parts["Проч"] = lat - sum(parts.get(k, 0) for k in
+                ("Сбор", "Дет", "Сним", "ВырОч", "Выр", "Оч", "NPU"))
         _count("seen")
         _stats.by_class[name] = _stats.by_class.get(name, 0) + 1
         _total.by_class[name] = _total.by_class.get(name, 0) + 1
@@ -801,7 +915,14 @@ def _decide(obj, received, session):
                 rec.error(e)
         if LOG_OBJECTS:
             fmt = lambda k: f"{parts[k]:.2f}" if k in parts else "—"
-            stages = " ".join(f"{k}={fmt(k)}" for k in ("Сбор", "Дет", "Выр", "Оч", "NPU"))
+            stages = " ".join(f"{k}={fmt(k)}" for k in
+                ("Сбор", "Дет", "ВырОч", "Выр", "Оч", "NPU"))
+            if PIPELINE_TIMING and PIPELINE_TIMING_EACH:
+                stages += ' {' + ' '.join(f'{k}={fmt(k)}' for k in
+                                       ("КамОч", "КамОчЗак", "Возраст", "Сним")) + '}'
+            if NPU_DETAIL_EACH and npu_detail:
+                stages += ' [' + ' '.join(f'{k}={fmt(k)}' for k in
+                                      ("Подг", "RKNN", "Рез")) + ']'
             if abs(parts.get("Проч", 0)) >= .1:
                 stages += f" Проч={fmt('Проч')}"
             total = f"{lat:.2f}" if actual_front is not None else "—"
@@ -841,7 +962,8 @@ def _worker():
 
 def _summary_worker():
     """Статистика отдельно от NPU: percentile не задерживает следующий crop."""
-    global _summary_at, _stats
+    global _summary_at, _stats, _pipeline_previous
+    import line_camera
     while True:
         time.sleep(min(.25, SUMMARY_SEC))
         diag.poll_manual()
@@ -858,8 +980,12 @@ def _summary_worker():
         if snapshot is not None:
             session, elapsed, stats = snapshot
             line = f"СВОДКА {elapsed:.1f} с | {stats.short()}"
+            now_pipeline = line_camera.sorting_metrics() if PIPELINE_TIMING else None
             with _lock:
                 if _active and session == _session:
+                    if now_pipeline is not None and _pipeline_previous is not None:
+                        line += "\n" + _pipeline_summary(_pipeline_previous, now_pipeline)
+                        _pipeline_previous = now_pipeline
                     print(line)
 
 

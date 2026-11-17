@@ -79,7 +79,12 @@ FIXED_RATE = 2000.0
 GAIN = 200
 
 from valve_config import CONFIG as _LOG_CONFIG
+CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
+CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
+CUT_QUEUE_SIZE = max(1, int(CUT_CONFIG.get("cut_queue_size", 32)))
 LOG_DETECTOR_DEBUG = bool((_LOG_CONFIG.get("logging") or {}).get("log_detector_debug", False))
+# Measurements are enabled during sorting; they do not alter segmentation.
+PIPELINE_TIMING = bool((_LOG_CONFIG.get("logging") or {}).get("pipeline_timing", True))
 
 STREAM_TRACKING = True # Если истинно, применяется отдельный модуль детекции 
 # который находится в stream_detector.py
@@ -333,6 +338,11 @@ class ObjectDetector:
         # Для каждой порции: (первая строка, строк, время конца захвата).
         # По нему считается, когда камера сняла любую строку буфера.
         self.times = deque(maxlen=self.buf_pieces)
+        # Separate capture-to-STREAM telemetry, indexed by absolute row.
+        # Values: time in the camera->detector queue, age since camera timestamp.
+        self.piece_pipeline = deque(maxlen=self.buf_pieces)
+        self._source_queue_wait_ms = 0.0
+        self._source_camera_age_ms = 0.0
         # Кому отдавать готовую серию для сортировки: on_run(lo, hi).
         # None - серии нужны только для кадров съёмки.
         self.on_run = None
@@ -340,6 +350,7 @@ class ObjectDetector:
         self.ker_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                    (CLOSE_K, CLOSE_K))
         self.total = 0                  # сколько строк прошло всего
+        self._history_first = 0         # абсолютная первая строка в pieces
 
         self.run_lo = None              # начало текущей серии
         self.run_hi = None              # конец (за последней занятой)
@@ -452,11 +463,7 @@ class ObjectDetector:
         counts, edge = self.row_stats(piece)
         busy = counts >= MIN_ROW_PIXELS
 
-        self.pieces.append(piece)
-        self.touch.append(counts >= TOUCH_PIXELS)
-        self.times.append((self.total, piece.shape[0], t_end, lag))
-        base = self.total
-        self.total += piece.shape[0]
+        base = self._store_piece(piece, counts >= TOUCH_PIXELS, t_end, lag)
 
         if not busy.any():
             self.idle += 1
@@ -594,6 +601,37 @@ class ObjectDetector:
             out.append(self._window(lo, hi))
         return out
 
+    def _store_piece(self, piece, touch, t_end, lag):
+        """Store an immutable camera block and maintain its absolute row origin.
+
+        Blocks are always `self.H` rows in this camera pipeline. Keeping the
+        origin allows O(number of requested blocks) reads instead of scanning
+        the entire 512-block history for every completed object.
+        """
+        first = self.total
+        if len(self.pieces) == self.buf_pieces:
+            self._history_first += self.pieces[0].shape[0]
+        self.pieces.append(piece)
+        self.touch.append(touch)
+        self.times.append((first, len(piece), t_end, lag))
+        self.piece_pipeline.append((self._source_queue_wait_ms,
+                                    self._source_camera_age_ms))
+        self.total += len(piece)
+        return first
+
+    def _time_record(self, row):
+        """Locate timestamp for an absolute row in the fixed-size history."""
+        if row < self._history_first or row >= self.total:
+            return None
+        index = (row - self._history_first) // self.H
+        if 0 <= index < len(self.times):
+            item = self.times[index]
+            if item[0] <= row < item[0] + item[1]:
+                return item
+        # Defensive fallback if a nonstandard caller supplies short blocks.
+        return next((item for item in reversed(self.times)
+                     if item[0] <= row < item[0] + item[1]), None)
+
     def row_time(self, row):
         """
         Когда камера сняла абсолютную строку row (time.monotonic) или None.
@@ -603,19 +641,33 @@ class ObjectDetector:
         задержка передачи по USB сюда не входит - её поглощает задержка
         клапанов, которую подбирают на машине.
         """
-        for first, n, t_end, _ in reversed(self.times):
-            if first <= row < first + n:
-                if t_end is None:
-                    return None
-                return t_end - (first + n - row) / ROWS_PER_SEC
-        return None
+        record = self._time_record(row)
+        if record is None:
+            return None
+        first, n, t_end, _ = record
+        if t_end is None:
+            return None
+        return t_end - (first + n - row) / ROWS_PER_SEC
 
     def row_lag(self, row):
         """На сколько мс позже своего времени камера отдала эту строку."""
-        for first, n, _, lag in reversed(self.times):
-            if first <= row < first + n:
-                return lag
-        return 0.0
+        record = self._time_record(row)
+        return record[3] if record is not None else 0.0
+
+    def row_pipeline(self, row):
+        """Queue wait and detector-start age for the block containing `row`.
+
+        These are diagnostic *overlapping* components of the existing `Дет`
+        clock, not additional time to sum with it. No SDK calls are made.
+        """
+        if row < self._history_first or row >= self.total:
+            return 0.0, 0.0
+        index = (row - self._history_first) // self.H
+        if 0 <= index < len(self.piece_pipeline):
+            item = self.times[index]
+            if item[0] <= row < item[0] + item[1]:
+                return self.piece_pipeline[index]
+        return 0.0, 0.0
 
     def extract_objects(self, lo, hi):
         """
@@ -633,7 +685,7 @@ class ObjectDetector:
             crop       BGR, вне маски чёрное
             t_front    когда камера сняла передний край, или None
         """
-        first = self.total - sum(p.shape[0] for p in self.pieces)
+        first = self._history_first
         start = max(first, lo - OBJECT_PAD)
         stop = min(self.total, hi + OBJECT_PAD)
         rows = self._rows(start, stop - start)
@@ -687,13 +739,19 @@ class ObjectDetector:
     def _rows(self, start, n):
         """n строк потока подряд, начиная с абсолютной строки start."""
         out = np.repeat(self.full_bg[None, :, :], n, axis=0)
-        pos = self.total - sum(p.shape[0] for p in self.pieces)
-        for piece in self.pieces:
-            a, b = pos, pos + piece.shape[0]
-            pos = b
-            lo, hi = max(a, start), min(b, start + n)
-            if lo < hi:
-                out[lo - start:hi - start] = piece[lo - a:hi - a]
+        lo, hi = max(start, self._history_first), min(start + n, self.total)
+        if lo >= hi:
+            return out
+        # Jump straight to the block that contains the requested first row.
+        idx = (lo - self._history_first) // self.H
+        while lo < hi and idx < len(self.pieces):
+            piece = self.pieces[idx]
+            base = self._history_first + idx * self.H
+            end = min(hi, base + len(piece))
+            if base <= lo < end:
+                out[lo - start:end - start] = piece[lo - base:end - base]
+                lo = end
+            idx += 1
         return out
 
     def _bg_fill(self, start, n):
@@ -816,6 +874,20 @@ class LineCamera:
         self.sort_errors = 0
         self.objects = 0
         self.detector = None
+        self.cut_queue = queue.Queue(maxsize=CUT_QUEUE_SIZE)
+        self.cut_enqueued = 0
+        self.cut_completed = 0
+        self.cut_queue_full = 0
+        self.cut_pending_max = 0
+        self.cut_wait_max_ms = 0.0
+        self.cut_wait_sum_ms = 0.0
+        self.cut_wait_n = 0
+        self.snapshot_n = 0
+        self.snapshot_sum_ns = 0
+        self.snapshot_max_ns = 0
+        # The detector thread updates the counters; the summary thread reads
+        # a best-effort snapshot. All durations use perf_counter_ns.
+        self.reset_pipeline_metrics()
 
         self._latest = None
         self._latest_id = 0
@@ -829,6 +901,21 @@ class LineCamera:
         self._avg_graph = None
         self._avg_acc = None            # накопитель усреднения, float32
         self._graph_at = 0.0            # когда обновляли последний раз
+
+    def reset_pipeline_metrics(self):
+        """Start fresh timing counters for the next sorting session."""
+        self.pipeline_pending_max = 0
+        self.pipeline_metrics = {key: 0 for stage in
+            ('cam_queue', 'cam_age', 'graph', 'feed', 'feed_cpu')
+            for key in (stage + '_n', stage + '_sum_ns', stage + '_max_ns')}
+
+    def _measure_pipeline(self, stage, ns):
+        if not PIPELINE_TIMING:
+            return
+        data = self.pipeline_metrics
+        data[stage + '_n'] += 1
+        data[stage + '_sum_ns'] += ns
+        data[stage + '_max_ns'] = max(data[stage + '_max_ns'], ns)
 
     def _update_graph(self, piece):
         """
@@ -1121,7 +1208,8 @@ class LineCamera:
             try:
                 # Номер порции нужен детектору: по пропуску в нумерации он
                 # понимает, что поток разорвался, и сбрасывает окно.
-                self.frames.put_nowait((seq, piece, t_true, lag))
+                self.frames.put_nowait((seq, piece, t_true, lag,
+                                        time.perf_counter_ns()))
             except queue.Full:
                 self.dropped += 1
                 if self.dropped in (1, 10, 100, 1000):
@@ -1155,9 +1243,21 @@ class LineCamera:
         expected = None
         while self._running:
             try:
-                seq, piece, t_end, lag = self.frames.get(timeout=1.0)
+                seq, piece, t_end, lag, queued_ns = self.frames.get(timeout=1.0)
             except queue.Empty:
                 continue
+            # Read as soon as possible after get(): otherwise graph/STREAM
+            # computation would be mistakenly charged to camera queue wait.
+            detector_start_ns = time.perf_counter_ns()
+            queue_wait_ns = max(0, detector_start_ns - queued_ns)
+            camera_age_ns = max(0, int((time.monotonic() - t_end) * 1e9)) if t_end is not None else 0
+            pending = self.frames.qsize()
+            self._measure_pipeline('cam_queue', queue_wait_ns)
+            self._measure_pipeline('cam_age', camera_age_ns)
+            if PIPELINE_TIMING:
+                self.pipeline_pending_max = max(self.pipeline_pending_max, pending)
+            det._source_queue_wait_ms = queue_wait_ns / 1e6
+            det._source_camera_age_ms = camera_age_ns / 1e6
 
             if expected is not None and seq != expected:
                 det.note_gap()
@@ -1167,7 +1267,10 @@ class LineCamera:
                           f"(всего разрывов {det.gaps}); "
                           f"от пяти подряд объект теряется")
             expected = seq + 1
+            graph_start_ns = time.perf_counter_ns() if PIPELINE_TIMING else 0
             self._update_graph(piece)
+            if PIPELINE_TIMING:
+                self._measure_pipeline('graph', time.perf_counter_ns() - graph_start_ns)
             det.frames_enabled = _object_sink is None
             if not _detect_enabled:
                 if getattr(det, "_stream_mode", False):
@@ -1183,7 +1286,15 @@ class LineCamera:
                     det._diag_entry = rec.detector_piece(seq, det.total)
                 except Exception as e:
                     rec.error(e)
-            for frame in det.feed(piece, t_end, lag):
+            feed_start_ns = time.perf_counter_ns() if PIPELINE_TIMING else 0
+            feed_cpu_start_ns = time.thread_time_ns() if PIPELINE_TIMING else 0
+            try:
+                results = det.feed(piece, t_end, lag)
+            finally:
+                if PIPELINE_TIMING:
+                    self._measure_pipeline('feed', time.perf_counter_ns() - feed_start_ns)
+                    self._measure_pipeline('feed_cpu', time.thread_time_ns() - feed_cpu_start_ns)
+            for frame in results:
                 self.objects += 1
                 with self._lock:
                     self._latest = frame
@@ -1191,38 +1302,122 @@ class LineCamera:
                 print(f"  камера: объект {self.objects}, "
                       f"кадр {frame.shape[1]}x{frame.shape[0]}")
 
+    def _emit_cut(self, det, sink, t_found, t_cut_start, objs, at_edge, entry,
+                  capture_ctx=None, snapshot_ms=0.0, snapshot_cpu_ms=0.0,
+                  queued_at=None):
+        t_cut_end = time.monotonic()
+        for o in objs:
+            o['t_found'] = t_found
+            o['t_cut_end'] = t_cut_end
+            o['cut_ms'] = (t_cut_end - t_cut_start) * 1000
+            # In async mode, exclude snapshot time from the worker queue wait.
+            # Previously ВырОч was measured from t_found and included the
+            # snapshot; this split makes the actual bottleneck visible.
+            o['cut_wait_ms'] = max(0, (t_cut_start - (queued_at or t_found)) * 1000)
+            if PIPELINE_TIMING:
+                o['snapshot_ms'] = snapshot_ms
+                o['snapshot_cpu_ms'] = snapshot_cpu_ms
+                if capture_ctx is not None:
+                    o['camera_queue_ms'], o['camera_age_ms'] = capture_ctx[:2]
+                    if len(capture_ctx) >= 4:
+                        o['camera_finish_queue_ms'] = capture_ctx[2]
+                        o['camera_finish_age_ms'] = capture_ctx[3]
+            if entry is not None:
+                o['_diag_entry'] = entry
+        sink(objs, at_edge)
+
+    def _run_cut_sync(self, det, sink, lo, hi, t_found, capture_ctx=None):
+        try:
+            objs, at_edge = det.extract_objects(lo, hi)
+            for o in objs:
+                o['t_last'] = det.row_time(o['row1'] - 1)
+            self._emit_cut(det, sink, t_found, t_found, objs, at_edge,
+                           getattr(det, '_diag_entry', None), capture_ctx)
+        except Exception:
+            self._cut_error()
+
+    def _cut_error(self):
+        self.sort_errors += 1
+        if self.sort_errors in (1, 10, 100, 1000):
+            print(f"  камера: ошибка при вырезке предметов "
+                  f"(всего {self.sort_errors}):")
+            traceback.print_exc()
+
+    def _cut_worker(self):
+        """Morphology and cropping outside the real-time STREAM tracker."""
+        while self._running or not self.cut_queue.empty():
+            try:
+                det, sink, snap, t_found, enqueued_at, capture_ctx, snap_ms, snap_cpu_ms = self.cut_queue.get(timeout=.2)
+            except queue.Empty:
+                continue
+            try:
+                t_cut_start = time.monotonic()
+                wait_ms = max(0, (t_cut_start - enqueued_at) * 1000)
+                self.cut_wait_sum_ms += wait_ms
+                self.cut_wait_n += 1
+                self.cut_wait_max_ms = max(self.cut_wait_max_ms, wait_ms)
+                objs, at_edge = det.extract_snapshot(snap)
+                self._emit_cut(det, sink, t_found, t_cut_start,
+                               objs, at_edge, snap['diag_entry'], capture_ctx,
+                               snap_ms, snap_cpu_ms, enqueued_at)
+                self.cut_completed += 1
+            except Exception:
+                self._cut_error()
+            finally:
+                self.cut_queue.task_done()
+
     def _on_run(self, det, lo, hi):
-        """
-        Серия закончилась. Если идёт сортировка - вырезать предметы и
-        отдать сортировщику. Вырезка делается здесь же, в потоке
-        детекции: строки серии лежат в буфере только пока он не провернулся.
-        Сама классификация идёт в потоке сортировщика и детекцию не держит.
+        """Completed TRACK: copy its lines promptly; crop in another thread.
+
+        The snapshot *owns* the RGB rows and timestamps. A worker never reads
+        the mutable camera history or the current diagnostic entry.
         """
         sink = _object_sink
         if sink is None:
             return
+        t_found = time.monotonic()
+        track = getattr(det, '_current_track', None)
+        capture_ctx = (*det.row_pipeline(track.last if track is not None else hi-1),
+                       det._source_queue_wait_ms, det._source_camera_age_ms)
+        if not (CUT_ASYNC and STREAM_TRACKING and track is not None):
+            self._run_cut_sync(det, sink, lo, hi, t_found, capture_ctx)
+            return
         try:
-            t0 = time.monotonic()
-            objs, at_edge = det.extract_objects(lo, hi)
-            # Для разбивки задержки в сводке сортировки: когда детектор
-            # увидел конец серии и сколько заняла вырезка.
-            for o in objs:
-                o["t_last"] = det.row_time(o["row1"] - 1)
-            t1 = time.monotonic()
-            for o in objs:
-                o["t_found"] = t0
-                o["t_cut_end"] = t1
-                o["cut_ms"] = (t1 - t0) * 1000
-                if getattr(det, '_diag_entry', None) is not None:
-                    o['_diag_entry'] = det._diag_entry
-            sink(objs, at_edge)
+            snap_start_ns = time.perf_counter_ns()
+            cpu_start_ns = time.thread_time_ns() if PIPELINE_TIMING else 0
+            snap = det.snapshot_track(lo, hi)
+            snap_end_ns = time.perf_counter_ns()
+            snap_ms = (snap_end_ns - snap_start_ns) / 1e6
+            snap_cpu_ms = ((time.thread_time_ns() - cpu_start_ns) / 1e6
+                           if PIPELINE_TIMING else 0.0)
+            self.snapshot_n += 1
+            self.snapshot_sum_ns += snap_end_ns - snap_start_ns
+            self.snapshot_max_ns = max(self.snapshot_max_ns,
+                                       snap_end_ns - snap_start_ns)
+            if snap is None:
+                return
+            enqueued_at = time.monotonic()
+            try:
+                self.cut_queue.put_nowait((det, sink, snap, t_found,
+                                           enqueued_at, capture_ctx,
+                                           snap_ms, snap_cpu_ms))
+                self.cut_enqueued += 1
+                self.cut_pending_max = max(self.cut_pending_max,
+                                           self.cut_queue.qsize())
+            except queue.Full:
+                # Never silently discard a physical grain. Emergency inline
+                # cropping can increase latency, but preserves the object.
+                self.cut_queue_full += 1
+                if self.cut_queue_full in (1, 10, 100):
+                    print(f'  камера: очередь вырезания заполнена '
+                          f'({self.cut_queue_full}); резервная синхронная вырезка')
+                t0 = time.monotonic()
+                objs, at_edge = det.extract_snapshot(snap)
+                self._emit_cut(det, sink, t_found, t0,
+                               objs, at_edge, snap['diag_entry'], capture_ctx,
+                               snap_ms, snap_cpu_ms, t0)
         except Exception:
-            # Ошибка вырезки не должна ронять поток детекции.
-            self.sort_errors += 1
-            if self.sort_errors in (1, 10, 100, 1000):
-                print(f"  камера: ошибка при вырезке предметов для "
-                      f"сортировки (всего {self.sort_errors}):")
-                traceback.print_exc()
+            self._cut_error()
 
     # --- фон ------------------------------------------------------------
 
@@ -1388,6 +1583,12 @@ class LineCamera:
         self._threads.append(t)
 
         background = self._collect_background()
+
+        if CUT_ASYNC and STREAM_TRACKING:
+            t = threading.Thread(target=self._cut_worker, daemon=True,
+                                 name="вырезание")
+            t.start()
+            self._threads.append(t)
 
         t = threading.Thread(target=self._detector, args=(background,),
                              daemon=True, name="детекция")
@@ -1555,6 +1756,22 @@ def average_graph():
     return None if _camera is None else _camera.average_graph()
 
 
+def reset_sorting_profile():
+    """Reset profiling maxima at session start (without changing detection)."""
+    cam = _camera
+    if cam is None:
+        return
+    cam.reset_pipeline_metrics()
+    cam.snapshot_max_ns = 0
+    cam.cut_wait_max_ms = 0.0
+    cam.cut_pending_max = 0
+    det = cam.detector
+    if det is not None and hasattr(det, 'stream_mask_max_ns'):
+        det.stream_mask_max_ns = 0
+        det.stream_track_max_ns = 0
+        det.stream_onrun_max_ns = 0
+
+
 def sorting_metrics():
     """Снимок счётчиков для лога; не меняет состояние камеры/детектора."""
     cam = _camera
@@ -1565,7 +1782,23 @@ def sorting_metrics():
                   gaps=d.gaps if d else 0, recoveries=cam.recoveries,
                   sort_errors=cam.sort_errors,
                   chunk_rows=cam.chunk_rows, width=cam.width,
-                  queue=cam.frames.qsize())
+                  queue=cam.frames.qsize(),
+                  cut_async=bool(CUT_ASYNC and STREAM_TRACKING),
+                  cut_enqueued=cam.cut_enqueued,
+                  cut_completed=cam.cut_completed,
+                  cut_queue_full=cam.cut_queue_full,
+                  cut_queue=cam.cut_queue.qsize(),
+                  cut_pending_max=cam.cut_pending_max,
+                  cut_wait_sum_ms=cam.cut_wait_sum_ms,
+                  cut_wait_max_ms=cam.cut_wait_max_ms,
+                  cut_wait_n=cam.cut_wait_n,
+                  snapshot_n=cam.snapshot_n,
+                  snapshot_sum_ns=cam.snapshot_sum_ns,
+                  snapshot_max_ns=cam.snapshot_max_ns,
+                  pipeline_timing=PIPELINE_TIMING)
+    if PIPELINE_TIMING:
+        result.update(cam.pipeline_metrics)
+        result['pipeline_pending_max'] = cam.pipeline_pending_max
     if d is not None and hasattr(d, "stream_pieces"):
         result.update(stream_finished=d.stream_finished,
                       stream_emitted=d.stream_emitted,
@@ -1576,7 +1809,12 @@ def sorting_metrics():
                       stream_active=len(d._tracker.active),
                       stream_pieces=d.stream_pieces,
                       stream_mask_ns=d.stream_mask_ns,
-                      stream_track_ns=d.stream_track_ns)
+                      stream_track_ns=d.stream_track_ns,
+                      stream_mask_max_ns=d.stream_mask_max_ns,
+                      stream_track_max_ns=d.stream_track_max_ns,
+                      stream_onrun_n=d.stream_onrun_n,
+                      stream_onrun_sum_ns=d.stream_onrun_sum_ns,
+                      stream_onrun_max_ns=d.stream_onrun_max_ns)
     return result
 
 

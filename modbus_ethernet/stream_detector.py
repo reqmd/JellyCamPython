@@ -144,6 +144,11 @@ def make_stream_detector(base, cfg):
             self.stream_mask_ns = 0
             self.stream_track_ns = 0
             self.stream_pieces = 0
+            self.stream_mask_max_ns = 0
+            self.stream_track_max_ns = 0
+            self.stream_onrun_n = 0
+            self.stream_onrun_sum_ns = 0
+            self.stream_onrun_max_ns = 0
             self._stream_busy_rows = 0
             self._stream_bg_warned = False
 
@@ -198,14 +203,13 @@ def make_stream_detector(base, cfg):
             # Maintain the original history (including timestamps) so capture
             # mode and the existing time-to-valve contract remain unchanged.
             base_row = self.total
-            self.pieces.append(piece)
-            self.touch.append(counts >= touch_pixels)
-            self.times.append((base_row, len(piece), t_end, lag))
-            self.total += len(piece)
+            self._store_piece(piece, counts >= touch_pixels, t_end, lag)
             occupied = bool(hit.any())
             if not occupied:
                 self.idle += 1
-            self.stream_mask_ns += perf_counter_ns() - t0
+            elapsed_mask_ns = perf_counter_ns() - t0
+            self.stream_mask_ns += elapsed_mask_ns
+            self.stream_mask_max_ns = max(self.stream_mask_max_ns, elapsed_mask_ns)
             self.stream_pieces += 1
             if not occupied and not self._tracker.active:
                 self._stream_busy_rows = 0
@@ -226,13 +230,16 @@ def make_stream_detector(base, cfg):
             # Find transitions for all rows at once. No Python loop over pixels.
             padded = np.pad(hit, ((0, 0), (1, 1)), constant_values=False)
             changes = padded[:, 1:] != padded[:, :-1]
-            self.stream_track_ns += perf_counter_ns() - track_t0
+            piece_track_ns = perf_counter_ns() - track_t0
+            self.stream_track_ns += piece_track_ns
             for i, transitions in enumerate(changes):
                 t0 = perf_counter_ns()
                 ends = np.flatnonzero(transitions) + x0
                 intervals = zip(ends[::2].tolist(), ends[1::2].tolist())
                 completed = self._tracker.step(base_row + i, intervals)
-                self.stream_track_ns += perf_counter_ns() - t0
+                row_track_ns = perf_counter_ns() - t0
+                self.stream_track_ns += row_track_ns
+                piece_track_ns += row_track_ns
                 for track in completed:
                     self.stream_finished += 1
                     if track.invalid or track.last - track.lo + 1 < min_rows:
@@ -244,10 +251,17 @@ def make_stream_detector(base, cfg):
                     # the exact post-morphology component area is authoritative.
                     if self.on_run is not None:
                         self._current_track = track
+                        onrun_start_ns = perf_counter_ns()
                         try:
                             self.on_run(track.lo, track.last + 1)
                         finally:
+                            onrun_ns = perf_counter_ns() - onrun_start_ns
+                            self.stream_onrun_n += 1
+                            self.stream_onrun_sum_ns += onrun_ns
+                            self.stream_onrun_max_ns = max(self.stream_onrun_max_ns,
+                                                           onrun_ns)
                             self._current_track = None
+            self.stream_track_max_ns = max(self.stream_track_max_ns, piece_track_ns)
             return []
 
         def _diag_track(self, track, reason, **extra):
@@ -261,38 +275,62 @@ def make_stream_detector(base, cfg):
                 except Exception as e:
                     rec.error(e)
 
+        def snapshot_track(self, lo, hi):
+            """Own real RGB rows and capture times before history advances.
+
+            Called in the detector thread, while `_current_track` refers to
+            the completed TRACK. Cropping itself can happen on another thread.
+            """
+            track = self._current_track
+            if track is None:
+                return None
+            if lo < self._history_first or hi > self.total:
+                self.rejected += 1
+                self.stream_invalid += 1
+                self._diag_track(track, 'history_missing')
+                return None
+            return dict(track=track, lo=lo, hi=hi,
+                        rows=self._rows(lo, hi-lo),
+                        timings=tuple((self.row_time(r), self.row_lag(r))
+                                      for r in range(lo, hi)),
+                        diag_rec=getattr(self, '_diag_rec', None),
+                        diag_entry=getattr(self, '_diag_entry', None))
+
         def extract_objects(self, lo, hi):
             track = self._current_track
             if track is None:
                 return super().extract_objects(lo, hi)
-            # Only pixels belonging to this tracked group enter its mask.
-            # Thus a different track in the local rectangle cannot be emitted
-            # again. Nearby tracks are conservatively merged by _Tracker.
-            first = self.total - sum(p.shape[0] for p in self.pieces)
-            if lo < first or hi > self.total:
-                self.rejected += 1
-                self.stream_invalid += 1
-                self._diag_track(track, 'history_missing')
+            snap = self.snapshot_track(lo, hi)
+            if snap is None:
                 return [], 0
+            return self.extract_snapshot(snap)
+
+        def extract_snapshot(self, snap):
+            """Pure crop over an immutable snapshot, safe in a worker thread.
+
+            Do not refer to current TRACK, camera history, or current diagnostic
+            piece: those change while the detector reads new camera blocks.
+            """
+            track = snap['track']
+            lo, hi = snap['lo'], snap['hi']
             left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
             start = lo - halo
             stop = hi + halo
-            mask = np.zeros((stop - start, right - left), np.uint8)
+            mask = np.zeros((stop-start, right-left), np.uint8)
             for row, a, b in track.runs:
-                mask[row - start, a - left:b - left] = 255
+                mask[row-start, a-left:b-left] = 255
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.ker_open)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
             n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             found, at_edge = [], 0
-            diagnostic = getattr(self, '_diag_entry', None) is not None
+            rec, entry = snap['diag_rec'], snap['diag_entry']
+            diagnostic = rec is not None and entry is not None
             components = [] if diagnostic else None
-            # Actual color pixels must be present; halo is mask-only, never
-            # fabricated RGB. Read the real track rows once, as before.
-            rows = self._rows(lo, hi - lo) if n > 1 else None
+            rows = snap['rows']
             for i in range(1, n):
                 x, y, w, h, area = (int(v) for v in st[i])
-                a, b = left + x, left + x + w
-                r0, r1 = start + y, start + y + h
+                a, b = left+x, left+x+w
+                r0, r1 = start+y, start+y+h
                 component = None
                 if diagnostic:
                     component = dict(x0=a,x1=b,row0=r0,row1=r1,area=area,reason='emitted')
@@ -300,12 +338,11 @@ def make_stream_detector(base, cfg):
                 if area < min_area:
                     if component is not None: component['reason'] = 'area'
                     continue
-                if a < x0 + edge or b > x1 - edge:
+                if a < x0+edge or b > x1-edge:
                     at_edge += 1
                     if component is not None: component['reason'] = 'edge'
                     continue
                 if r0 < lo or r1 > hi:
-                    # No crop outside real tracked rows; count explicitly.
                     self.stream_invalid += 1
                     if component is not None: component['reason'] = 'outside_rows'
                     continue
@@ -317,24 +354,28 @@ def make_stream_detector(base, cfg):
                 if median_kernel > 1:
                     crop = cv2.medianBlur(crop, median_kernel)
                 crop[filled == 0] = 0
-                found.append(dict(x0=a, x1=b, row0=r0, row1=r1,
-                                  area=area, crop=crop,
-                                  t_front=self.row_time(r0),
-                                  cam_lag_ms=self.row_lag(r0),
+                t_front, lag = snap['timings'][r0-lo]
+                t_last, _ = snap['timings'][r1-1-lo]
+                found.append(dict(x0=a,x1=b,row0=r0,row1=r1,
+                                  area=area,crop=crop,t_front=t_front,
+                                  t_last=t_last,cam_lag_ms=lag,
                                   track_id=track.ident))
             if diagnostic:
-                # RLE preserves the exact local post-morph mask, without PNG I/O.
                 try:
                     transitions = np.diff(np.pad(mask != 0, ((0,0),(1,1))).astype(np.int8), axis=1)
                     ys, xs = np.nonzero(transitions)
                     post = None
                     if len(xs) <= 20000:
                         post = [[int(y), int(a), int(b)] for y,a,b in zip(ys[::2], xs[::2], xs[1::2])]
-                    self._diag_track(track, 'segmented' if found else 'empty',
-                        components=components, mask_origin=[start,left], mask_shape=list(mask.shape),
-                        post_runs=post, raw_runs=[list(r) for r in track.runs] if len(track.runs) <= 10000 else None, emitted=len(found))
+                    rec.track(entry, dict(track_id=track.ident, row0=track.lo,
+                        row1=track.last+1, x0=track.x0, x1=track.x1,
+                        raw_area=track.area, reason='segmented' if found else 'empty',
+                        components=components, mask_origin=[start,left],
+                        mask_shape=list(mask.shape), post_runs=post,
+                        raw_runs=[list(r) for r in track.runs] if len(track.runs) <= 10000 else None,
+                        emitted=len(found)))
                 except Exception as e:
-                    self._diag_rec.error(e)
+                    rec.error(e)
             self.stream_emitted += len(found)
             if not found:
                 self.stream_empty += 1
