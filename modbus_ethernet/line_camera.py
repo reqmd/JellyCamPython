@@ -38,6 +38,7 @@ from ctypes import (CDLL, byref, c_float, c_int, c_uint, c_ushort,
                     create_string_buffer)
 
 import cv2
+import diagnostic_capture as diag
 import numpy as np
 
 if sys.platform == "win32":
@@ -76,6 +77,9 @@ FIXED_RATE = 2000.0
 # сильнее усиления влияет уровень чёрного (camera.black_level).
 # Подбор: python3 camera_tools.py --gain-sweep.
 GAIN = 200
+
+from valve_config import CONFIG as _LOG_CONFIG
+LOG_DETECTOR_DEBUG = bool((_LOG_CONFIG.get("logging") or {}).get("log_detector_debug", False))
 
 STREAM_TRACKING = True # Если истинно, применяется отдельный модуль детекции 
 # который находится в stream_detector.py
@@ -203,7 +207,7 @@ MIN_ROW_PIXELS = 25
 GAP_ROWS = 3
 MIN_ROWS = 6
 TH = 15
-MIN_AREA = 400
+MIN_AREA = 200
 # Вырезка предметов для сортировки. Маска строится так же, как в
 # capture_simple.py, на котором набирались картинки для обучения: отличие
 # от фона, открытие ядром OPEN_K (убрать одиночные точки), замыкание
@@ -480,7 +484,7 @@ class ObjectDetector:
                 if self.gap >= GAP_ROWS:
                     self._close()
         # Диагностика активной серии
-        if self.run_lo is not None:
+        if LOG_DETECTOR_DEBUG and self.run_lo is not None:
         
             run_len = self.run_hi - self.run_lo
         
@@ -535,19 +539,21 @@ class ObjectDetector:
         if hi - lo < MIN_ROWS:
             self.rejected += 1
     
-            print(
-                f"ОТСЕЯНО: мало строк, "
-                f"{hi - lo} < {MIN_ROWS}"
-            )
+            if LOG_DETECTOR_DEBUG:
+                print(
+                    f"ОТСЕЯНО: мало строк, "
+                    f"{hi - lo} < {MIN_ROWS}"
+                )
             return
     
         if px < MIN_AREA:
             self.rejected += 1
     
-            print(
-                f"ОТСЕЯНО: малая площадь, "
-                f"{px} < {MIN_AREA}"
-            )
+            if LOG_DETECTOR_DEBUG:
+                print(
+                    f"ОТСЕЯНО: малая площадь, "
+                    f"{px} < {MIN_AREA}"
+                )
             return
     
         # Рабочая сортировка остается без изменений
@@ -559,16 +565,17 @@ class ObjectDetector:
     
         # В режиме съёмки не отбрасываем весь кадр,
         # если один из объектов задел край полосы.
-        if edge:
+        if edge and LOG_DETECTOR_DEBUG:
             print(
                 f"СЕРИЯ ЗАДЕЛА КРАЙ: "
                 f"строк={hi - lo}, площадь={px}"
             )
     
-        print(
-            f"СЕРИЯ ПРИНЯТА: "
-            f"строк={hi - lo}, площадь={px}"
-        )
+        if LOG_DETECTOR_DEBUG:
+            print(
+                f"СЕРИЯ ПРИНЯТА: "
+                f"строк={hi - lo}, площадь={px}"
+            )
     
         self.pending.append((lo, hi))
 
@@ -596,7 +603,7 @@ class ObjectDetector:
         задержка передачи по USB сюда не входит - её поглощает задержка
         клапанов, которую подбирают на машине.
         """
-        for first, n, t_end, _ in self.times:
+        for first, n, t_end, _ in reversed(self.times):
             if first <= row < first + n:
                 if t_end is None:
                     return None
@@ -605,7 +612,7 @@ class ObjectDetector:
 
     def row_lag(self, row):
         """На сколько мс позже своего времени камера отдала эту строку."""
-        for first, n, _, lag in self.times:
+        for first, n, _, lag in reversed(self.times):
             if first <= row < first + n:
                 return lag
         return 0.0
@@ -1105,6 +1112,12 @@ class LineCamera:
             acc = []
             seq += 1
             piece = self.process(piece)
+            rec = diag.current()
+            if rec is not None:
+                try:
+                    rec.capture(seq, piece, t_true, lag, t_end)
+                except Exception as e:
+                    rec.error(e)
             try:
                 # Номер порции нужен детектору: по пропуску в нумерации он
                 # понимает, что поток разорвался, и сбрасывает окно.
@@ -1162,6 +1175,14 @@ class LineCamera:
             
                 continue
 
+            rec = diag.current()
+            det._diag_rec = rec
+            det._diag_entry = None
+            if rec is not None and not det.frames_enabled:
+                try:
+                    det._diag_entry = rec.detector_piece(seq, det.total)
+                except Exception as e:
+                    rec.error(e)
             for frame in det.feed(piece, t_end, lag):
                 self.objects += 1
                 with self._lock:
@@ -1185,10 +1206,15 @@ class LineCamera:
             objs, at_edge = det.extract_objects(lo, hi)
             # Для разбивки задержки в сводке сортировки: когда детектор
             # увидел конец серии и сколько заняла вырезка.
+            for o in objs:
+                o["t_last"] = det.row_time(o["row1"] - 1)
             t1 = time.monotonic()
             for o in objs:
                 o["t_found"] = t0
+                o["t_cut_end"] = t1
                 o["cut_ms"] = (t1 - t0) * 1000
+                if getattr(det, '_diag_entry', None) is not None:
+                    o['_diag_entry'] = det._diag_entry
             sink(objs, at_edge)
         except Exception:
             # Ошибка вырезки не должна ронять поток детекции.
@@ -1527,6 +1553,31 @@ def live_graph():
 def average_graph():
     """Усреднённая строка для графика. None, если камеры нет."""
     return None if _camera is None else _camera.average_graph()
+
+
+def sorting_metrics():
+    """Снимок счётчиков для лога; не меняет состояние камеры/детектора."""
+    cam = _camera
+    if cam is None:
+        return None
+    d = cam.detector
+    result = dict(grabbed=cam.grabbed, dropped=cam.dropped,
+                  gaps=d.gaps if d else 0, recoveries=cam.recoveries,
+                  sort_errors=cam.sort_errors,
+                  chunk_rows=cam.chunk_rows, width=cam.width,
+                  queue=cam.frames.qsize())
+    if d is not None and hasattr(d, "stream_pieces"):
+        result.update(stream_finished=d.stream_finished,
+                      stream_emitted=d.stream_emitted,
+                      stream_empty=d.stream_empty,
+                      stream_invalid=d.stream_invalid,
+                      stream_resets=d.stream_resets,
+                      stream_merged=d._tracker.merged,
+                      stream_active=len(d._tracker.active),
+                      stream_pieces=d.stream_pieces,
+                      stream_mask_ns=d.stream_mask_ns,
+                      stream_track_ns=d.stream_track_ns)
+    return result
 
 
 def status():

@@ -45,6 +45,7 @@ import cv2
 import numpy as np
 
 import valves
+import diagnostic_capture as diag
 from valve_config import (CONFIG, HERE, REGISTERS, VALVE_BASE,
                           VALVE_COUNT_REG)
 
@@ -129,6 +130,11 @@ SORT_DEFAULTS = {
 
 CFG = dict(SORT_DEFAULTS)
 CFG.update(CONFIG.get("sorting") or {})
+LOG_CFG = dict(CONFIG.get("logging") or {})
+LOG_OBJECTS = bool(LOG_CFG.get("log_objects", CFG["log_each"]))
+LOG_SUMMARY = bool(LOG_CFG.get("log_summary", True))
+SUMMARY_SEC = max(0.1, float(LOG_CFG.get("summary_sec", CFG["summary_sec"])))
+LOG_POSITIONS = bool(LOG_CFG.get("log_positions", False))
 # Имена классов - строки (это имена папок при обучении). Если в настройках
 # записано число, например 0 вместо "0", приводим к строке, иначе класс
 # не совпал бы ни с одним ответом сети и молча не отбивался бы.
@@ -335,7 +341,7 @@ def valves_for(x0, x1, zones):
 # Состояние
 # --------------------------------------------------------------------------
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # события и согласованные счётчики сессии
 _active = False
 _session = 0                 # номер сортировки: старые события не трогать
 _next_mode = None            # "sorting" / "shooting" - что подготовлено
@@ -343,6 +349,10 @@ _duration_ms = 0
 _delay_ms = 0
 _units = 1                   # длительность в единицах платы
 _saved = 0
+_started_at = None
+_camera_base = None
+_logger_base = 0
+_spi_inflight = 0
 
 _objects = queue.Queue(maxsize=256)
 _events = []                 # куча (когда, номер, клапаны, единиц, сессия)
@@ -359,94 +369,105 @@ class _Stats:
         self.reset()
 
     def reset(self):
-        self.seen = 0            # предметов пришло от камеры
-        self.by_class = {}       # класс -> сколько
-        self.rejected = 0        # из них в списке отбиваемых
-        self.low_conf = 0        # в списке, но сеть не уверена
-        self.no_valve = 0        # отбить нечем: вне зон клапанов
-        self.fired = 0           # кадров на плату
-        self.late = 0            # открыто с опозданием
-        self.too_late = 0        # не открыто: опоздание больше предела
-        self.at_edge = 0         # обрезаны краем полосы
-        self.dropped = 0         # очередь переполнена
-        self.unknown = 0         # не классифицировано: нет модели
-        self.latency = []        # мс от камеры до решения
-        # Из чего складывается задержка, мс:
-        # "буфер камеры" - на сколько позже своего времени камера отдала
-        # строку с передним краем предмета; уже входит в "до детектора".
-        self.parts = {"до детектора": [], "буфер камеры": [], "вырезка": [],
-                      "очередь": [], "сеть": []}
+        self.seen = 0
+        self.queued = 0        # объектов принято в очередь NPU
+        self.by_class = {}
+        self.rejected = 0       # поставлены в очередь клапанов (не факт отбивания)
+        self.low_conf = 0
+        self.no_valve = 0
+        self.fired = 0          # успешные вызовы SPI, кадры могут объединяться
+        self.spi_errors = 0
+        self.late = 0           # решения, поставленные в очередь позже срока
+        self.too_late = 0       # команда отменена по пределу опоздания
+        self.at_edge = 0
+        self.dropped = 0
+        self.unknown = 0
+        self.errors = 0
+        self.no_time = 0
+        self.latency = []
+        self.parts = {k: [] for k in ("Сбор", "Дет", "Выр", "Оч", "NPU", "Проч")}
+        self.spi_late = []      # отклонение начала вызова SPI от due, со знаком
 
     def short(self):
-        """Сводка в одну короткую строку - для лога каждые summary_sec."""
-        cls = ", ".join(f"класс {k} - {v}"
-                        for k, v in sorted(self.by_class.items()))
-        text = f"предметов {self.seen}" + (f" ({cls})" if cls else "")
-        text += f", отбито {self.rejected}"
-        bad = [f"{name} {val}" for name, val in (
-            ("опоздали и не отбиты", self.too_late),
+        cls = " ".join(f"Кл{k}={v}" for k, v in sorted(self.by_class.items()))
+        text = (f"объектов={self.seen} | {cls or 'нет классов'} | "
+                f"OK={self.rejected - self.late} Поздно={self.late} "
+                f"Не отправлено={self.too_late} Проход={self.passed()} "
+                f"| SPI кадров={self.fired} ошибок={self.spi_errors}")
+        bad = [f"{name}={value}" for name, value in (
+            ("край", self.at_edge), ("потеряно", self.dropped),
             ("вне клапанов", self.no_valve), ("неуверенно", self.low_conf),
-            ("обрезаны краем", self.at_edge), ("потеряны", self.dropped),
-            ("без модели", self.unknown)) if val]
+            ("без модели", self.unknown), ("ошибки", self.errors)) if value]
         if bad:
-            text += ", " + ", ".join(bad)
+            text += " | " + " ".join(bad)
         if self.latency:
-            text += f"; решение в среднем через {np.mean(self.latency):.0f} мс"
-        if self.late:
-            text += (f"; {self.late} отбиты позже заданной задержки - "
-                     f"сервер не успел")
+            text += (f" | Итог сред={np.mean(self.latency):.2f} "
+                     f"p95={np.percentile(self.latency, 95):.2f} "
+                     f"макс={max(self.latency):.2f} мс")
         return text
 
+    def passed(self):
+        return sum(v for k, v in self.by_class.items()
+                   if k not in CFG["reject_classes"])
+
     def line(self):
-        cls = ", ".join(f"{k} {v}" for k, v in sorted(self.by_class.items()))
-        lat = ""
-        if self.latency:
-            lat = (f", решение через {np.mean(self.latency):.0f} мс после "
-                   f"камеры (макс {max(self.latency):.0f}: "
-                   + ", ".join(f"{k} {np.mean(v):.1f}/{max(v):.1f}"
-                               for k, v in self.parts.items() if v)
-                   + " - среднее/макс)")
-        extra = [f"{name} {val}" for name, val in (
-            ("неуверенно", self.low_conf), ("вне клапанов", self.no_valve),
-            ("с опозданием", self.late), ("опоздали, не отбиты", self.too_late),
-            ("у края полосы", self.at_edge), ("очередь полна", self.dropped),
-            ("без модели", self.unknown)) if val]
-        return (f"предметов {self.seen} ({cls or 'нет'}), отбито "
-                f"{self.rejected}, кадров на плату {self.fired}"
-                + (", " + ", ".join(extra) if extra else "") + lat
-                + self.hint())
-
-    def hint(self):
-        """
-        Если решения опаздывают, сказать прямо, какую задержку ставить.
-
-        Пока задержка меньше времени решения, клапан открывается в момент
-        решения, и менять регистр 11 в этих пределах бесполезно: на ленте
-        ничего не изменится.
-        """
-        if not (self.late or self.too_late) or not self.latency:
-            return ""
-        tick = float(CFG["delay_tick_ms"]) or 1.0
-        # По 95-му проценту, а не по максимуму: один предмет из плотной
-        # пачки, решённый за 100 мс, не должен диктовать задержку всем.
-        p95 = float(np.percentile(self.latency, 95))
-        need = p95 + 2                        # запас на разброс
-        reg = int(-(-need // tick))           # округление вверх
-        return (f". ПОДСКАЗКА: задержка {_delay_ms:g} мс меньше времени "
-                f"решения ({p95:.0f} мс у 95% предметов) - эти клапаны "
-                f"открылись в момент решения, а не по задержке. Чтобы "
-                f"задержка выдерживалась у 95% предметов, нужно "
-                f"~{reg * tick:g} мс, регистр {DELAY_REG} = {reg}")
+        n = self.rejected + self.too_late + self.low_conf + self.no_valve
+        on = self.rejected - self.late
+        pct = lambda v: f" ({100*v/n:.1f}%)" if n else ""
+        cls = " | ".join(f"Класс {k}: {v}" for k, v in sorted(self.by_class.items()))
+        lines = [f"  Объектов классифицировано: {sum(self.by_class.values())} | {cls or 'нет классов'}",
+                 f"  Принято в очередь: {self.queued} | разобрано: {self.seen} | "
+                 f"не разобрано на стоп: {max(0, self.queued - self.seen - self.errors)}",
+                 f"  Вовремя: {on}{pct(on)} | С опозданием: {self.late}{pct(self.late)} | "
+                 f"Не отправлено по сроку: {self.too_late}{pct(self.too_late)} | Проход: {self.passed()}",
+                 f"  Отказы: низкая уверенность={self.low_conf} вне клапанов={self.no_valve} "
+                 f"край={self.at_edge} очередь полна={self.dropped} без модели={self.unknown} "
+                 f"ошибки={self.errors} без метки времени={self.no_time}",
+                 "  ВРЕМЯ, мс       СРЕДНЕЕ      P95      МАКС"]
+        for name, values in [*self.parts.items(), ("ИТОГ", self.latency),
+                             ("SPI откл.", self.spi_late)]:
+            if values:
+                lines.append(f"  {name:<14} {np.mean(values):8.2f} "
+                             f"{np.percentile(values, 95):8.2f} {max(values):8.2f}")
+            else:
+                lines.append(f"  {name:<14} {'—':>8} {'—':>8} {'—':>8}")
+        lines.append(f"  SPI: успешных кадров={self.fired} | ошибок={self.spi_errors}")
+        return "\n".join(lines)
 
 
 _stats = _Stats()
-_total = _Stats()            # за всю сортировку, от старта до стопа
+_total = _Stats()
 _summary_at = time.monotonic()
 
 
 def _count(name, n=1):
-    setattr(_stats, name, getattr(_stats, name) + n)
-    setattr(_total, name, getattr(_total, name) + n)
+    with _lock:
+        setattr(_stats, name, getattr(_stats, name) + n)
+        setattr(_total, name, getattr(_total, name) + n)
+
+
+def _camera_summary(before, after):
+    if after is None:
+        return "  Камера: нет данных"
+    prefix = ""
+    if before is None:
+        before = {}
+        prefix = "  Камера не была готова на старте; ниже счётчики с её запуска.\n"
+    def delta(key):
+        return after.get(key, 0) - before.get(key, 0)
+    text = (f"  Камера: порций={delta('grabbed')} потери={delta('dropped')} "
+            f"разрывы={delta('gaps')} восстановлений={delta('recoveries')} "
+            f"ошибки вырезки={delta('sort_errors')} очередь={after['queue']}")
+    if "stream_pieces" in after:
+        n = delta('stream_pieces')
+        text += (f"\n  STREAM: завершено={delta('stream_finished')} "
+                 f"выдано={delta('stream_emitted')} пустых={delta('stream_empty')} "
+                 f"невалидных={delta('stream_invalid')} объединено={delta('stream_merged')} "
+                 f"сброшено={delta('stream_resets')} активно на стоп={after['stream_active']}")
+        if n > 0:
+            text += (f" | маска={delta('stream_mask_ns')/n/1e6:.3f} "
+                     f"трек={delta('stream_track_ns')/n/1e6:.3f} мс/порция")
+    return prefix + text
 
 
 # --------------------------------------------------------------------------
@@ -497,15 +518,16 @@ def _check_layout(zones):
     step = (xs[-1] - xs[0]) / (n - 1) if n > 1 else 0
     first = min(pts, key=lambda p: p[1])[0]
     last = max(pts, key=lambda p: p[1])[0]
-    print(f"сортировка: клапаны по координатам ({source}) - {n} шт., "
-          f"клапан 1 на x {first:.0f}, клапан {n} на x {last:.0f}, шаг "
-          f"{step:.1f}; на плате подключено {valves.VALVE_COUNT}; "
-          f"предметы ищутся в столбцах {line_camera.X0}..{line_camera.X1}")
-    axis = _mirror_axis()
-    print("сортировка: инверсия позиции " +
-          ("выключена (mirror_x)" if axis is None else
-           f"ВКЛЮЧЕНА, ось x {axis:.1f}: предмет слева на снимке отбивается "
-           f"клапанами справа"))
+    if LOG_POSITIONS:
+        print(f"сортировка: клапаны по координатам ({source}) - {n} шт., "
+              f"клапан 1 на x {first:.0f}, клапан {n} на x {last:.0f}, шаг "
+              f"{step:.1f}; на плате подключено {valves.VALVE_COUNT}; "
+              f"предметы ищутся в столбцах {line_camera.X0}..{line_camera.X1}")
+        axis = _mirror_axis()
+        print("сортировка: инверсия позиции " +
+              ("выключена (mirror_x)" if axis is None else
+               f"ВКЛЮЧЕНА, ось x {axis:.1f}: предмет слева на снимке отбивается "
+               f"клапанами справа"))
     if n != valves.VALVE_COUNT:
         print(f"сортировка: ВНИМАНИЕ - приложение прислало {n} клапанов, а "
               f"на плате {valves.VALVE_COUNT}. Зоны стоят не на своих "
@@ -520,29 +542,44 @@ def _check_layout(zones):
 
 
 def _start():
-    global _active, _session, _saved
+    global _active, _session, _saved, _started_at, _camera_base, _logger_base, _summary_at, _stats, _total
     import capture
     import line_camera
     if capture.MODE != capture.MODE_LINE_CAMERA:
         print("сортировка: не запущена - в capture.py режим съёмки не "
               "линейная камера (MODE = 1, картинка с диска)")
         return
+    import logger
     with _lock:
-        _active = True
         _session += 1
         _events.clear()
         _saved = 0
-    _read_params()
-    _stats.reset()
-    _total.reset()
-    line_camera.set_object_sink(_on_objects)
-
+        _read_params()
+        _stats = _Stats()
+        _total = _Stats()
+        _started_at = _summary_at = time.monotonic()
+        _camera_base = line_camera.sorting_metrics()
+        _logger_base = logger.dropped_count()
+        _active = True
+    session = _session
     zones = valve_zones()
-    _check_layout(zones)
     reject = list(CFG["reject_classes"])
-    print(f"сортировка: старт. {_params_text()}; отбиваем "
-          f"{reject or 'НИЧЕГО - список reject_classes пуст'}; клапанов с "
-          f"координатами {len(zones)}")
+    print(f"=== СОРТИРОВКА: СТАРТ | сессия={session} ===")
+    cam = _camera_base or {}
+    print(f"  Камера: {cam.get('width', '?')}x{cam.get('chunk_rows', '?')} | "
+          f"LINES={line_camera.LINES} PROC_ROWS={line_camera.PROC_ROWS} | "
+          f"задано {line_camera.ROWS_PER_SEC:g} строк/с | "
+          f"выдержка={line_camera.EXPOSURE_MS:g} мс")
+    print(f"  Детектор: {'STREAM' if line_camera.STREAM_TRACKING else 'SERIES'} | "
+          f"ROI={line_camera.X0}..{line_camera.X1} TH={line_camera.TH} "
+          f"GAP={line_camera.GAP_ROWS} MIN_ROWS={line_camera.MIN_ROWS} MIN_AREA={line_camera.MIN_AREA} "
+          f"LINK_X={line_camera.STREAM_LINK_X} MIN_RUN={line_camera.STREAM_MIN_RUN}")
+    model = _classifier
+    print(f"  Модель: {f'{model.size}x{model.size} | классы={model.classes}' if model is not None else 'не готова'} "
+          f"| отбиваем={reject}")
+    print(f"  Клапаны: {len(zones)} | задержка={_delay_ms:.2f} мс | импульс={_duration_ms:.2f} мс "
+          f"| инверсия={'ON' if CFG['mirror_x'] else 'OFF'}")
+    _check_layout(zones)
     if _classifier_error:
         print(f"сортировка: сеть недоступна - {_classifier_error}. "
               f"Предметы будут считаться, но не отбиваться")
@@ -554,19 +591,46 @@ def _start():
     if not line_camera.ready():
         print("сортировка: камера ещё не готова, предметы пойдут, как "
               "только она поднимется")
+    diag_params = {k:getattr(line_camera,k) for k in
+        ('X0','X1','LINES','PROC_ROWS','FIXED_RATE','ROWS_PER_SEC','TH','GAP_ROWS',
+         'MIN_ROWS','MIN_AREA','STREAM_LINK_X','STREAM_MIN_RUN','OPEN_K','CLOSE_K','EDGE_OLD','MEDIAN_KERNEL')}
+    diag_params.update(delay_ms=_delay_ms, duration_ms=_duration_ms,
+                       reject_classes=reject, mirror_x=bool(CFG['mirror_x']))
+    diag.start(session, line_camera._camera, diag_params)
+    line_camera.set_object_sink(lambda objs, edge: _on_objects(objs, edge, session))
 
 
 def _stop(why):
     global _active
     import line_camera
+    import logger
     with _lock:
         if not _active:
             return
         _active = False
+        cancelled = len(_events)
         _events.clear()
         _events_cv.notify_all()
-    line_camera.set_object_sink(None)
-    print(f"сортировка: стоп ({why}). Итого: {_total.line()}")
+        after = line_camera.sorting_metrics()
+        line_camera.set_object_sink(None)
+        # Снимок ровно на переходе в ожидание. Уже начавшийся SPI-вызов
+        # может завершиться позже; показываем это отдельно.
+        session = _session
+        elapsed = time.monotonic() - _started_at
+        total, before = _total, _camera_base
+        inflight = _spi_inflight
+        logs_dropped = logger.dropped_count() - _logger_base
+    print(f"=== СОРТИРОВКА: СТОП ({why}) | сессия={session} ===")
+    print(f"  Длительность: {elapsed:.2f} сек")
+    print(total.line())
+    print(_camera_summary(before, after))
+    print(f"  На стоп: отменено событий клапанов={cancelled} "
+          f"SPI в работе={inflight} | пропущено строк лога={logs_dropped}")
+    diag.stop()
+    if why == f"регистр {COMMAND_REG} = 1":
+        print("=== КАМЕРА: РЕЖИМ ОЖИДАНИЯ ===")
+    else:
+        print("=== СОРТИРОВКА НЕАКТИВНА ===")
 
 
 def is_active():
@@ -605,26 +669,31 @@ def on_write(start, values):
 
     if _active and (start <= DURATION_REG < start + n
                     or start <= DELAY_REG < start + n):
-        was = (_duration_ms, _delay_ms)
-        _read_params()
-        if (_duration_ms, _delay_ms) != was:
-            print(f"сортировка: теперь {_params_text()}")
+        with _lock:
+            was = (_duration_ms, _delay_ms)
+            _read_params()
+            if (_duration_ms, _delay_ms) != was:
+                print(f"сортировка: теперь {_params_text()}")
 
 
 # --------------------------------------------------------------------------
 # Предметы от камеры
 # --------------------------------------------------------------------------
 
-def _on_objects(objs, at_edge):
+def _on_objects(objs, at_edge, session):
     """Из потока детекции: только положить в очередь и вернуться."""
-    if at_edge:
-        _count("at_edge", at_edge)
-    if not objs:
-        return
-    try:
-        _objects.put_nowait((_session, time.monotonic(), objs))
-    except queue.Full:
-        _count("dropped", len(objs))
+    with _lock:
+        if not _active or session != _session:
+            return
+        if at_edge:
+            _count("at_edge", at_edge)
+        if not objs:
+            return
+        try:
+            _objects.put_nowait((session, time.monotonic(), objs))
+            _count("queued", len(objs))
+        except queue.Full:
+            _count("dropped", len(objs))
 
 
 def _save_crop(crop, name, conf):
@@ -642,81 +711,108 @@ def _save_crop(crop, name, conf):
     _saved += 1
 
 
-def _decide(obj, received):
-    """Классифицировать один предмет и, если надо, назначить клапаны."""
-    _count("seen")
-    if _classifier is None:
-        _count("unknown")
-        return
+def _decide(obj, received, session):
+    """Классификация и прежняя политика планирования; новый только лог."""
+    with _lock:
+        if not _active or session != _session:
+            return
+        model = _classifier
+        if model is None:
+            _count("seen")
+            _count("unknown")
+            return
     crop = obj["crop"]
     t_nn = time.monotonic()
-    name, conf = _classifier(crop)
-    nn_ms = (time.monotonic() - t_nn) * 1000
-    _stats.by_class[name] = _stats.by_class.get(name, 0) + 1
-    _total.by_class[name] = _total.by_class.get(name, 0) + 1
+    name, conf = model(crop)
+    t_nn_end = time.monotonic()
+    nn_ms = (t_nn_end - t_nn) * 1000
     _save_crop(crop, name, conf)
 
-    now = time.monotonic()
-    t_front = obj["t_front"] if obj["t_front"] is not None else received
-    lat = (now - t_front) * 1000
-    _stats.latency.append(lat)
-    _total.latency.append(lat)
-    parts = {"сеть": nn_ms, "очередь": (t_nn - received) * 1000}
-    if obj.get("t_found") is not None:
-        parts["до детектора"] = (obj["t_found"] - t_front) * 1000
-        parts["вырезка"] = obj["cut_ms"]
-    if obj.get("cam_lag_ms") is not None:
-        parts["буфер камеры"] = obj["cam_lag_ms"]
-    for k, v in parts.items():
-        _stats.parts[k].append(v)
-        _total.parts[k].append(v)
-
-    # Одна строка на предмет: номер, класс, где он (под какими клапанами)
-    # и что с ним сделано. Подробная позиция на снимке - в конце строки.
+    # Срок по-прежнему отсчитывается от t_front. Измеряем решение
+    # после вычисления клапанов, непосредственно перед планированием.
+    actual_front = obj.get("t_front")
+    t_front = actual_front if actual_front is not None else received
+    t_last = obj.get("t_last")
+    t_found = obj.get("t_found")
+    cut_end = obj.get("t_cut_end")
+    parts = {"NPU": nn_ms, "Оч": (t_nn - (cut_end if cut_end is not None else received)) * 1000}
+    if obj.get("cut_ms") is not None:
+        parts["Выр"] = obj["cut_ms"]
+    if actual_front is not None and t_last is not None:
+        parts["Сбор"] = (t_last - actual_front) * 1000
+        if t_found is not None:
+            parts["Дет"] = (t_found - t_last) * 1000
     x0, x1, where = object_position(obj)
     hit = valves_for(x0, x1, valve_zones())
-    head = (f"предмет {_total.seen}: класс {name} ({conf:.2f}), "
-            f"под клапанами {_span(hit)}")
-    tail = f"   [{where}]"
 
-    def say(text):
-        if CFG["log_each"]:
-            print(f"{head} - {text}{tail}")
-
-    if name not in CFG["reject_classes"]:
-        say("не отбиваем")
-        return
-    if conf < float(CFG["min_confidence"]):
-        _count("low_conf")
-        say(f"не отбит: сеть не уверена (порог {CFG['min_confidence']})")
-        return
-    if not hit:
-        _count("no_valve")
-        say("не отбит: вне зон клапанов")
-        return
-
-    due = t_front + _delay_ms / 1000
-    wait = (due - now) * 1000
-    if wait < -float(CFG["late_limit_ms"]):
-        _count("too_late")
-        say(f"НЕ ОТБИТ: решение через {lat:.0f} мс, а задержка "
-            f"{_delay_ms:g} мс - предмет уже пролетел")
-        return
-    _count("rejected")
     with _lock:
-        heapq.heappush(_events, (due, next(_seq), hit, _units, _session))
-        _events_cv.notify()
-    if wait < 0:
-        _count("late")
-        say(f"ОТБИТ ПОЗЖЕ: через {lat:.0f} мс после камеры вместо "
-            f"{_delay_ms:g}")
-    else:
-        say(f"отбит через {_delay_ms:g} мс после камеры")
+        if not _active or session != _session:
+            return
+        now = time.monotonic()
+        lat = (now - t_front) * 1000
+        if actual_front is not None and all(k in parts for k in ("Сбор", "Дет", "Выр", "Оч", "NPU")):
+            parts["Проч"] = lat - sum(parts.values())
+        _count("seen")
+        _stats.by_class[name] = _stats.by_class.get(name, 0) + 1
+        _total.by_class[name] = _total.by_class.get(name, 0) + 1
+        if actual_front is not None:
+            _stats.latency.append(lat)
+            _total.latency.append(lat)
+        else:
+            _count("no_time")
+        for k, v in parts.items():
+            _stats.parts[k].append(v)
+            _total.parts[k].append(v)
+        number = _total.seen
+        due = t_front + _delay_ms / 1000
+        wait = (due - now) * 1000
+        event_id = None
+        if name not in CFG["reject_classes"]:
+            status = "ПРОХОД"
+        elif conf < float(CFG["min_confidence"]):
+            _count("low_conf")
+            status = "НЕ ОТПРАВЛЕН: уверенность"
+        elif not hit:
+            _count("no_valve")
+            status = "НЕ ОТПРАВЛЕН: вне клапанов"
+        elif wait < -float(CFG["late_limit_ms"]):
+            _count("too_late")
+            status = f"НЕ ОТПРАВЛЕН +{-wait:.2f}"
+        else:
+            _count("rejected")
+            event_id = next(_seq)
+            heapq.heappush(_events, (due, event_id, hit, _units, session))
+            _events_cv.notify()
+            if wait < 0:
+                _count("late")
+                status = f"ПОЗДНО +{-wait:.2f}"
+            else:
+                status = f"OK +{wait:.2f}"
+        if actual_front is None:
+            status += " [нет метки камеры; срок от очереди]"
+        rec = diag.current()
+        if rec is not None and rec.session == session:
+            try:
+                rec.decision(obj.get('_diag_entry'), dict(number=number, track_id=obj.get('track_id'),
+                    x0=obj['x0'], x1=obj['x1'], row0=obj['row0'], row1=obj['row1'], area=obj['area'],
+                    cls=str(name), confidence=float(conf), parts=parts, latency_ms=lat,
+                    status=status, valves=list(hit), event_id=event_id, due=due, decision=now))
+            except Exception as e:
+                rec.error(e)
+        if LOG_OBJECTS:
+            fmt = lambda k: f"{parts[k]:.2f}" if k in parts else "—"
+            stages = " ".join(f"{k}={fmt(k)}" for k in ("Сбор", "Дет", "Выр", "Оч", "NPU"))
+            if abs(parts.get("Проч", 0)) >= .1:
+                stages += f" Проч={fmt('Проч')}"
+            total = f"{lat:.2f}" if actual_front is not None else "—"
+            tail = f" | клапаны={_span(hit)} [{where}]" if LOG_POSITIONS else ""
+            print(f"#{number:04d} | Кл={name} {conf*100:.1f}% | {stages} | "
+                  f"Итог={total} мс | {status}{tail}")
 
 
 def _worker():
     """Поток сети: грузит модель один раз, затем разбирает очередь."""
-    global _classifier, _classifier_error, _summary_at
+    global _classifier, _classifier_error
     try:
         _classifier = Classifier()
         print(f"сортировка: модель {_classifier.model}, классы "
@@ -734,17 +830,37 @@ def _worker():
         if session is not None and _active and session == _session:
             for obj in objs:
                 try:
-                    _decide(obj, received)
+                    _decide(obj, received, session)
                 except Exception as e:
+                    with _lock:
+                        if _active and session == _session:
+                            _count("errors")
                     print(f"сортировка: ошибка при разборе предмета: {e!r}")
 
+
+
+def _summary_worker():
+    """Статистика отдельно от NPU: percentile не задерживает следующий crop."""
+    global _summary_at, _stats
+    while True:
+        time.sleep(min(.25, SUMMARY_SEC))
+        diag.poll_manual()
+        snapshot = None
         now = time.monotonic()
-        if now - _summary_at >= float(CFG["summary_sec"]):
-            if _active and _stats.seen:
-                print(f"сводка за {now - _summary_at:.0f} с: "
-                      f"{_stats.short()}")
-            _stats.reset()
-            _summary_at = now
+        if now - _summary_at >= SUMMARY_SEC:
+            with _lock:
+                now = time.monotonic()
+                if now - _summary_at >= SUMMARY_SEC:
+                    if LOG_SUMMARY and _active and (_stats.seen or _stats.dropped or _stats.spi_errors or _stats.errors or _stats.at_edge or _stats.fired):
+                        snapshot = (_session, now - _summary_at, _stats)
+                    _stats = _Stats()
+                    _summary_at = now
+        if snapshot is not None:
+            session, elapsed, stats = snapshot
+            line = f"СВОДКА {elapsed:.1f} с | {stats.short()}"
+            with _lock:
+                if _active and session == _session:
+                    print(line)
 
 
 def _firer():
@@ -753,6 +869,7 @@ def _firer():
     приходятся на одно и то же время с точностью до merge_ms, уходят
     одним кадром.
     """
+    global _spi_inflight
     merge = float(CFG["merge_ms"]) / 1000
     while True:
         with _lock:
@@ -764,21 +881,51 @@ def _firer():
                 _events_cv.wait(timeout=due - now)
                 continue
             batch, units = set(), 0
+            batch_dues = []
+            batch_ids = []
+            batch_session = _session
             while _events and _events[0][0] <= now + merge:
-                _, _, hit, u, session = heapq.heappop(_events)
+                event_due, event_id, hit, u, session = heapq.heappop(_events)
                 if session == _session and _active:
                     batch.update(hit)
                     units = max(units, u)
+                    batch_dues.append(event_due)
+                    batch_ids.append(event_id)
+            if batch:
+                _spi_inflight += 1
         if batch:
-            if valves.fire_many(sorted(batch), units):
-                _count("fired")
+            t_spi = time.monotonic()
+            ok = False
+            try:
+                ok = valves.fire_many(sorted(batch), units)
+            except Exception as exc:
+                print(f"SPI ERROR: {exc!r}")
+            finally:
+                with _lock:
+                    _spi_inflight -= 1
+                    if _active and batch_session == _session:
+                        _count("fired" if ok else "spi_errors")
+                        if ok:
+                            values = [(t_spi - d) * 1000 for d in batch_dues]
+                            _stats.spi_late.extend(values)
+                            _total.spi_late.extend(values)
+            rec = diag.current()
+            if rec is not None and rec.session == batch_session:
+                try:
+                    rec.spi(dict(event_ids=batch_ids, valves=sorted(batch), units=units,
+                                 due=batch_dues, t_spi=t_spi, ok=bool(ok)))
+                except Exception as e:
+                    rec.error(e)
+            if not ok:
+                print("SPI ERROR: команда клапанам не отправлена")
 
 
 def prepare():
     """При старте сервера: потоки сети и клапанов, загрузка модели."""
     if _threads:
         return
-    for target, name in ((_worker, "сортировка"), (_firer, "клапаны")):
+    for target, name in ((_worker, "сортировка"), (_firer, "клапаны"),
+                         (_summary_worker, "сводки")):
         t = threading.Thread(target=target, daemon=True, name=name)
         t.start()
         _threads.append(t)

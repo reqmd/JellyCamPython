@@ -33,6 +33,7 @@ class _Tracker:
         self.max_rows = max(1, max_rows)
         self.active = []
         self.next_id = 0
+        self.merged = 0  # диагностический счётчик, не влияет на связывание
 
     def reset(self):
         n = len(self.active)
@@ -56,6 +57,7 @@ class _Tracker:
         else:
             a.runs.extend(b.runs)
         self.active.remove(b)
+        self.merged += 1
 
     def step(self, row, intervals):
         """Intervals are half-open in absolute sensor X; row is absolute Y."""
@@ -156,8 +158,6 @@ def make_stream_detector(base, cfg):
             super().note_gap()
 
         def _change_mode(self, mode):
-            if self._stream_mode and not mode:
-                print(f"  камера: {self.stream_status()}", flush=True)
             self.reset_stream()
             # An object crossing a mode change is deliberately discarded.
             self.run_lo = self.run_hi = None
@@ -187,6 +187,13 @@ def make_stream_detector(base, cfg):
             d -= row_median(d[:, ::8])
             np.abs(d, out=d)
             hit = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2]) > threshold
+            rec = getattr(self, '_diag_rec', None)
+            entry = getattr(self, '_diag_entry', None)
+            if rec is not None and entry is not None:
+                try:
+                    rec.mask(entry, hit)
+                except Exception as e:
+                    rec.error(e)
             counts = hit[:, ::col_step].sum(axis=1) * col_step
             # Maintain the original history (including timestamps) so capture
             # mode and the existing time-to-valve contract remain unchanged.
@@ -231,6 +238,7 @@ def make_stream_detector(base, cfg):
                     if track.invalid or track.last - track.lo + 1 < min_rows:
                         self.rejected += 1
                         self.stream_invalid += 1
+                        self._diag_track(track, 'too_long' if track.invalid else 'short')
                         continue
                     # No global MIN_ROW_PIXELS/approximate MIN_AREA prefilter:
                     # the exact post-morphology component area is authoritative.
@@ -241,6 +249,17 @@ def make_stream_detector(base, cfg):
                         finally:
                             self._current_track = None
             return []
+
+        def _diag_track(self, track, reason, **extra):
+            rec = getattr(self, '_diag_rec', None)
+            entry = getattr(self, '_diag_entry', None)
+            if rec is not None and entry is not None:
+                try:
+                    rec.track(entry, dict(track_id=track.ident, row0=track.lo,
+                        row1=track.last+1, x0=track.x0, x1=track.x1,
+                        raw_area=track.area, reason=reason, **extra))
+                except Exception as e:
+                    rec.error(e)
 
         def extract_objects(self, lo, hi):
             track = self._current_track
@@ -253,6 +272,7 @@ def make_stream_detector(base, cfg):
             if lo < first or hi > self.total:
                 self.rejected += 1
                 self.stream_invalid += 1
+                self._diag_track(track, 'history_missing')
                 return [], 0
             left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
             start = lo - halo
@@ -264,21 +284,30 @@ def make_stream_detector(base, cfg):
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
             n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             found, at_edge = [], 0
+            diagnostic = getattr(self, '_diag_entry', None) is not None
+            components = [] if diagnostic else None
             # Actual color pixels must be present; halo is mask-only, never
             # fabricated RGB. Read the real track rows once, as before.
             rows = self._rows(lo, hi - lo) if n > 1 else None
             for i in range(1, n):
                 x, y, w, h, area = (int(v) for v in st[i])
-                if area < min_area:
-                    continue
                 a, b = left + x, left + x + w
                 r0, r1 = start + y, start + y + h
+                component = None
+                if diagnostic:
+                    component = dict(x0=a,x1=b,row0=r0,row1=r1,area=area,reason='emitted')
+                    components.append(component)
+                if area < min_area:
+                    if component is not None: component['reason'] = 'area'
+                    continue
                 if a < x0 + edge or b > x1 - edge:
                     at_edge += 1
+                    if component is not None: component['reason'] = 'edge'
                     continue
                 if r0 < lo or r1 > hi:
                     # No crop outside real tracked rows; count explicitly.
                     self.stream_invalid += 1
+                    if component is not None: component['reason'] = 'outside_rows'
                     continue
                 m = (lab[y:y+h, x:x+w] == i).astype(np.uint8)
                 cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -293,6 +322,19 @@ def make_stream_detector(base, cfg):
                                   t_front=self.row_time(r0),
                                   cam_lag_ms=self.row_lag(r0),
                                   track_id=track.ident))
+            if diagnostic:
+                # RLE preserves the exact local post-morph mask, without PNG I/O.
+                try:
+                    transitions = np.diff(np.pad(mask != 0, ((0,0),(1,1))).astype(np.int8), axis=1)
+                    ys, xs = np.nonzero(transitions)
+                    post = None
+                    if len(xs) <= 20000:
+                        post = [[int(y), int(a), int(b)] for y,a,b in zip(ys[::2], xs[::2], xs[1::2])]
+                    self._diag_track(track, 'segmented' if found else 'empty',
+                        components=components, mask_origin=[start,left], mask_shape=list(mask.shape),
+                        post_runs=post, raw_runs=[list(r) for r in track.runs] if len(track.runs) <= 10000 else None, emitted=len(found))
+                except Exception as e:
+                    self._diag_rec.error(e)
             self.stream_emitted += len(found)
             if not found:
                 self.stream_empty += 1

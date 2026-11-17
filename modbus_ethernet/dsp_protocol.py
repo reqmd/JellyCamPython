@@ -24,6 +24,7 @@ import capture
 import valves
 import sorter
 from valve_config import (
+    CONFIG,
     REGISTERS,                    # общий словарь регистров, второго быть не должно
     VALVE_COUNT_REG, VALVE_BASE,
     VALVE_W_COUNT_REG, VALVE_W_BASE,
@@ -83,15 +84,9 @@ TIMED_FRAMES = 100
 DUP_BIG_READ_SEC = 1.0
 _last_big = (None, 0.0)          # (байты запроса, когда ушёл ответ)
 
-# Чтения, которые не печатаются: приложение спрашивает их по нескольку раз
-# в секунду (99 - статус всегда, 69 и 41090 - во время сортировки), и лог
-# состоял в основном из них. Вместо каждой строки раз в QUIET_SUMMARY_SEC
-# печатается одна сводка - по ней видно, что приложение на связи.
-# Пустое множество - печатать всё.
-QUIET_READ_REGS = {99, 69, 41090}
-QUIET_SUMMARY_SEC = 60
-_quiet_count = {}
-_quiet_since = time.monotonic()
+# Подробные чтения/записи отключены по умолчанию. true в config.json
+# включает полный протокольный лог, включая частые чтения графика/статуса.
+LOG_REGISTERS = bool((CONFIG.get("logging") or {}).get("log_registers", False))
 
 # --------------------------------------------------------------------------
 # Данные камеры: 2048 пикселей, по три канала на пиксель, вперемежку.
@@ -326,20 +321,6 @@ def build_write_response(start: int, count: int) -> bytes:
 # Обработка запроса
 # --------------------------------------------------------------------------
 
-def quiet_read(start):
-    """Учесть тихое чтение; раз в QUIET_SUMMARY_SEC напечатать сводку."""
-    global _quiet_count, _quiet_since
-    _quiet_count[start] = _quiet_count.get(start, 0) + 1
-    now = time.monotonic()
-    if now - _quiet_since >= QUIET_SUMMARY_SEC:
-        sec = now - _quiet_since
-        regs = ", ".join(f"{r} - {n} ({n / sec:.1f}/с)"
-                         for r, n in sorted(_quiet_count.items()))
-        print(f"статус: за {sec:.0f} с запрошены регистры {regs}")
-        _quiet_count = {}
-        _quiet_since = now
-
-
 def handle(data: bytes):
     """
     Возвращает кадры ответа: список для записи, генератор для чтения.
@@ -359,13 +340,11 @@ def handle(data: bytes):
             print(f"чтение: регистр {start}, количество {count} -- "
                   f"вне допустимого (1..{MAX_READ_REGS}), игнорирую")
             return []
-        if start in QUIET_READ_REGS and count <= 8:
-            quiet_read(start)
-            return iter_read_frames(start, count)
         per = MAX_REGS_PER_FRAME or count
         parts = -(-count // per)          # округление вверх
-        print(f"чтение: регистр {start}, количество {count}"
-              f"{f', ответ из {parts} фрагментов' if parts > 1 else ''}")
+        if LOG_REGISTERS:
+            print(f"чтение: регистр {start}, количество {count}"
+                  f"{f', ответ из {parts} фрагментов' if parts > 1 else ''}")
         return iter_read_frames(start, count)
 
     if func == FUNC_WRITE:
@@ -373,8 +352,9 @@ def handle(data: bytes):
             return []
         values = list(struct.unpack(f">{count}H", data[11:11 + count * 2]))
 
-        shown = values if count <= 8 else values[:8] + ["..."]
-        print(f"запись: регистр {start}, количество {count}, значения {shown}")
+        if LOG_REGISTERS:
+            shown = values if count <= 8 else values[:8] + ["..."]
+            print(f"запись: регистр {start}, количество {count}, значения {shown}")
 
         # Записанное попадает в карту регистров, чтобы его можно было прочитать.
         for i, v in enumerate(values):
@@ -501,8 +481,9 @@ def _skip_duplicate(data, now):
     prev, when = _last_big
     if data == prev and now - when < DUP_BIG_READ_SEC:
         start = struct.unpack(">I", data[3:7])[0]
-        print(f"чтение: регистр {start} - повтор того же запроса через "
-              f"{(now - when) * 1000:.0f} мс после ответа, второй раз не шлю")
+        if LOG_REGISTERS:
+            print(f"чтение: регистр {start} - повтор того же запроса через "
+                  f"{(now - when) * 1000:.0f} мс после ответа, второй раз не шлю")
         return True
     return False
 
@@ -514,6 +495,8 @@ def _report_time(data, frames, t_recv, t_first):
     total = (now - t_recv) * 1000
     if _is_big_read(data):
         _last_big = (data, now)
+    if not LOG_REGISTERS:
+        return
     if frames < TIMED_FRAMES and total < SLOW_REPLY_MS:
         return
     start = struct.unpack(">I", data[3:7])[0] if len(data) >= 7 else -1

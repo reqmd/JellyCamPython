@@ -42,5 +42,27 @@
     "ccm": null,
     "gain": 200,
     "black_level": null
+  },
+  "logging": {
+    "log_registers": false,
+    "log_objects": true,
+    "log_summary": true,
+    "summary_sec": 10,
+    "log_positions": false,
+    "log_detector_debug": false
+  },
+  "diagnostics": {
+    "enabled": false,
+    "auto_trigger": true,
+    "directory": "diagnostics",
+    "pre_ms": 80,
+    "post_ms": 220,
+    "max_ms": 500,
+    "manual_ms": 1500,
+    "max_fragments": 24,
+    "max_memory_mb": 384,
+    "trigger_threshold": 25,
+    "trigger_pixels": 5,
+    "manual_file": "/tmp/jellycam-diagnostic-trigger"
   }
 }
