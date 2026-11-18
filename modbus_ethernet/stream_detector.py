@@ -26,7 +26,7 @@ class _Track:
 
 
 class _Tracker:
-    def __init__(self, gap, link, min_run, max_rows):
+    def __init__(self, gap, link, min_run, max_rows, use_spatial_index=True):
         self.gap = max(1, gap)
         self.link = max(0, link)
         self.min_run = max(1, min_run)
@@ -34,6 +34,11 @@ class _Tracker:
         self.active = []
         self.next_id = 0
         self.merged = 0  # диагностический счётчик, не влияет на связывание
+        self.use_spatial_index = bool(use_spatial_index)
+        self.indexed_rows = 0
+        self.linear_rows = 0
+        self.index_candidates = 0
+        self.linear_candidates = 0
 
     def reset(self):
         n = len(self.active)
@@ -60,8 +65,13 @@ class _Tracker:
         self.merged += 1
 
     def step(self, row, intervals):
-        """Intervals are half-open in absolute sensor X; row is absolute Y."""
-        # Group nearby intervals in the same row, but preserve their raw runs.
+        """Match raw horizontal runs, preserving the original merge order.
+
+        When many tracks or groups exist, use a conservative spatial index.
+        Track lifetime X bounds are a *superset* of all frontier intervals,
+        so it cannot exclude a real match. The exact `_near` test and the
+        original active-list order still decide every association.
+        """
         groups = []
         for a, b in intervals:
             if b - a < self.min_run:
@@ -75,18 +85,61 @@ class _Tracker:
         for t in self.active:
             t.new_frontier.clear()
 
+        indexed = self.use_spatial_index and len(self.active) + len(groups) >= 24
+        if indexed:
+            self.indexed_rows += 1
+            bucket_width = 64
+            buckets = {}
+            indexed_span = {}
+            alive = {t.ident: t for t in self.active}
+            order = {t.ident: i for i, t in enumerate(self.active)}
+            next_order = len(order)
+
+            def index_track(t):
+                # Include the link distance. Expanding track bounds must
+                # update buckets immediately for later groups on this row.
+                a_bin = (t.x0 - self.link) // bucket_width
+                b_bin = (t.x1 + self.link) // bucket_width
+                existing = indexed_span.setdefault(t.ident, set())
+                for k in range(a_bin, b_bin+1):
+                    if k not in existing:
+                        buckets.setdefault(k, []).append(t)
+                        existing.add(k)
+
+            for t in self.active:
+                index_track(t)
+        else:
+            self.linear_rows += 1
+
         for a, b, raw in groups:
-            matches = [t for t in self.active
+            if indexed:
+                ids = set()
+                for k in range(a // bucket_width, b // bucket_width + 1):
+                    for candidate in buckets.get(k, ()):
+                        if candidate.ident in alive:
+                            ids.add(candidate.ident)
+                candidates = [alive[k] for k in sorted(ids, key=order.__getitem__)]
+                self.index_candidates += len(candidates)
+            else:
+                candidates = self.active
+                self.linear_candidates += len(candidates)
+            matches = [t for t in candidates
                        if self._near(a, b, t.frontier)
                        or self._near(a, b, t.new_frontier)]
             if matches:
                 t = matches[0]
                 for other in matches[1:]:
                     self._merge(t, other)
+                    if indexed:
+                        alive.pop(other.ident, None)
             else:
                 self.next_id += 1
                 t = _Track(self.next_id, row, row, a, b)
                 self.active.append(t)
+                if indexed:
+                    alive[t.ident] = t
+                    order[t.ident] = next_order
+                    next_order += 1
             t.x0, t.x1 = min(t.x0, a), max(t.x1, b)
             t.new_frontier.append((a, b))
             t.area += sum(d - c for c, d in raw)
@@ -95,6 +148,8 @@ class _Tracker:
                 t.runs.clear()
             if not t.invalid:
                 t.runs.extend((row, c, d) for c, d in raw)
+            if indexed:
+                index_track(t)
 
         done, keep = [], []
         for t in self.active:
@@ -125,6 +180,9 @@ def make_stream_detector(base, cfg):
     # Can be overridden in line_camera.py for an A/B test.
     link = int(cfg.get('STREAM_LINK_X', close_k - 1))
     min_run = int(cfg.get('STREAM_MIN_RUN', 3))
+    track_prefilter = bool(cfg.get('STREAM_TRACK_PREFILTER', False))
+    snapshot_band = bool(cfg.get('STREAM_SNAPSHOT_BAND', False))
+    tracker_index = bool(cfg.get('STREAM_TRACK_INDEX', False))
     # OPEN + CLOSE have a finite spatial support. Give the mask a zero halo.
     halo = 2 * (open_k // 2 + close_k // 2)
 
@@ -132,13 +190,16 @@ def make_stream_detector(base, cfg):
         def __init__(self, full_bg, piece_rows, bg_rows=None):
             super().__init__(full_bg, piece_rows, bg_rows)
             self._tracker = _Tracker(gap, link, min_run,
-                                     self.buf_pieces * self.H - 2 * halo - self.H)
+                                     self.buf_pieces * self.H - 2 * halo - self.H,
+                                     use_spatial_index=tracker_index)
             self._stream_mode = False
             self._current_track = None
             self._stream_bg_src = None
             self.stream_finished = 0
             self.stream_emitted = 0
             self.stream_invalid = 0
+            self.stream_prefilter_area = 0
+            self.stream_prefilter_edge = 0
             self.stream_resets = 0
             self.stream_empty = 0
             self.stream_mask_ns = 0
@@ -247,8 +308,28 @@ def make_stream_detector(base, cfg):
                         self.stream_invalid += 1
                         self._diag_track(track, 'too_long' if track.invalid else 'short')
                         continue
-                    # No global MIN_ROW_PIXELS/approximate MIN_AREA prefilter:
-                    # the exact post-morphology component area is authoritative.
+                    if track_prefilter:
+                        # OPEN is anti-extensive. CLOSE with a symmetric flat
+                        # kernel stays within the raw mask bounding rectangle
+                        # (the mask has a zero halo). Consequently no output
+                        # component can exceed this *bounding box area*.
+                        # Do NOT use raw pixel count: CLOSE may fill holes.
+                        max_area = (track.x1 - track.x0) * (track.last - track.lo + 1)
+                        if max_area < min_area:
+                            self.stream_prefilter_area += 1
+                            self.stream_empty += 1
+                            self.rejected += 1
+                            self._diag_track(track, 'prefilter_area', max_area=max_area)
+                            continue
+                        # If the ENTIRE raw bounding box is within the
+                        # forbidden side strip, no post-morph component can
+                        # pass the unchanged edge test either.
+                        if track.x1 <= x0 + edge or track.x0 >= x1 - edge:
+                            self.stream_prefilter_edge += 1
+                            self.stream_empty += 1
+                            self.rejected += 1
+                            self._diag_track(track, 'prefilter_edge')
+                            continue
                     if self.on_run is not None:
                         self._current_track = track
                         onrun_start_ns = perf_counter_ns()
@@ -289,10 +370,15 @@ def make_stream_detector(base, cfg):
                 self.stream_invalid += 1
                 self._diag_track(track, 'history_missing')
                 return None
-            return dict(track=track, lo=lo, hi=hi,
-                        rows=self._rows(lo, hi-lo),
-                        timings=tuple((self.row_time(r), self.row_lag(r))
-                                      for r in range(lo, hi)),
+            left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
+            offset = left if snapshot_band else 0
+            rows = (self._rows_band(lo, hi-lo, left, right)
+                    if snapshot_band else self._rows(lo, hi-lo))
+            return dict(track=track, lo=lo, hi=hi, x_offset=offset,
+                        rows=rows,
+                        timings=(self._snapshot_timings(lo, hi) if snapshot_band
+                                 else tuple((self.row_time(r), self.row_lag(r))
+                                            for r in range(lo, hi))),
                         diag_rec=getattr(self, '_diag_rec', None),
                         diag_entry=getattr(self, '_diag_entry', None))
 
@@ -350,7 +436,8 @@ def make_stream_detector(base, cfg):
                 cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 filled = np.zeros_like(m)
                 cv2.drawContours(filled, cnts, -1, 1, thickness=cv2.FILLED)
-                crop = rows[r0-lo:r1-lo, a:b].copy()
+                crop = rows[r0-lo:r1-lo,
+                            a-snap.get('x_offset', 0):b-snap.get('x_offset', 0)].copy()
                 if median_kernel > 1:
                     crop = cv2.medianBlur(crop, median_kernel)
                 crop[filled == 0] = 0

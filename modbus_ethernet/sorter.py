@@ -499,9 +499,15 @@ def _camera_summary(before, after):
         n = delta('stream_pieces')
         text += (f"\n  STREAM: завершено={delta('stream_finished')} "
                  f"выдано={delta('stream_emitted')} пустых={delta('stream_empty')} "
-                 f"невалидных={delta('stream_invalid')} объединено={delta('stream_merged')} "
+                 f"невалидных={delta('stream_invalid')} "
+                 f"до снимка (площадь/край)={delta('stream_prefilter_area')}/"
+                 f"{delta('stream_prefilter_edge')} объединено={delta('stream_merged')} "
                  f"сброшено={delta('stream_resets')} активно на стоп={after['stream_active']}")
         if n > 0:
+            text += (f" | индекс строк={delta('stream_tracker_indexed_rows')} "
+                     f"линейных={delta('stream_tracker_linear_rows')} "
+                     f"кандидатов(инд/лин)={delta('stream_tracker_index_candidates')}/"
+                     f"{delta('stream_tracker_linear_candidates')}")
             text += (f" | маска={delta('stream_mask_ns')/n/1e6:.3f} "
                      f"трек={delta('stream_track_ns')/n/1e6:.3f} мс/порция")
     if after.get('pipeline_timing'):
@@ -661,6 +667,9 @@ def _start():
           f"ROI={line_camera.X0}..{line_camera.X1} TH={line_camera.TH} "
           f"GAP={line_camera.GAP_ROWS} MIN_ROWS={line_camera.MIN_ROWS} MIN_AREA={line_camera.MIN_AREA} "
           f"LINK_X={line_camera.STREAM_LINK_X} MIN_RUN={line_camera.STREAM_MIN_RUN}")
+    print(f"  STREAM оптимизации: до снимка={'ON' if line_camera.STREAM_TRACK_PREFILTER else 'OFF'} "
+          f"полоса снимка={'ON' if line_camera.STREAM_SNAPSHOT_BAND else 'OFF'} "
+          f"индекс TRACK={'ON' if line_camera.STREAM_TRACK_INDEX else 'OFF'}")
     model = _classifier
     print(f"  Модель: {f'{model.size}x{model.size} | классы={model.classes}' if model is not None else 'не готова'} "
           f"| отбиваем={reject}")

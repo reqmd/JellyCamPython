@@ -71,6 +71,9 @@
   },
   "processing": {
     "async_cut": true,
-    "cut_queue_size": 32
+    "cut_queue_size": 32,
+    "track_prefilter": true,
+    "snapshot_band": true,
+    "tracker_index": true
   }
 }

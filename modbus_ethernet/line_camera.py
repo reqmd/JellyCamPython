@@ -82,6 +82,10 @@ from valve_config import CONFIG as _LOG_CONFIG
 CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
 CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
 CUT_QUEUE_SIZE = max(1, int(CUT_CONFIG.get("cut_queue_size", 32)))
+# Safe A/B switches: false restores the unoptimized STREAM path.
+STREAM_TRACK_PREFILTER = bool(CUT_CONFIG.get("track_prefilter", True))
+STREAM_SNAPSHOT_BAND = bool(CUT_CONFIG.get("snapshot_band", True))
+STREAM_TRACK_INDEX = bool(CUT_CONFIG.get("tracker_index", True))
 LOG_DETECTOR_DEBUG = bool((_LOG_CONFIG.get("logging") or {}).get("log_detector_debug", False))
 # Measurements are enabled during sorting; they do not alter segmentation.
 PIPELINE_TIMING = bool((_LOG_CONFIG.get("logging") or {}).get("pipeline_timing", True))
@@ -750,6 +754,61 @@ class ObjectDetector:
             end = min(hi, base + len(piece))
             if base <= lo < end:
                 out[lo - start:end - start] = piece[lo - base:end - base]
+                lo = end
+            idx += 1
+        return out
+
+    def _snapshot_timings(self, start, stop):
+        """Snapshot per-row timestamps with one deque lookup per camera block.
+
+        This has exactly the same timestamp expression and row order as
+        ``(row_time(row), row_lag(row))`` for every row, but does not search
+        the same block twice for every pixel row. Called only from STREAM
+        during snapshot creation; workers never read live camera history.
+        """
+        if not (self._history_first <= start <= stop <= self.total):
+            return tuple((self.row_time(r), self.row_lag(r))
+                         for r in range(start, stop))
+        result = []
+        row = start
+        index = (start - self._history_first) // self.H
+        while row < stop and index < len(self.times):
+            origin, n, t_end, lag = self.times[index]
+            if not origin <= row < origin + n:
+                # Nonstandard/short piece: preserve the old exact behavior.
+                return tuple((self.row_time(r), self.row_lag(r))
+                             for r in range(start, stop))
+            finish = min(stop, origin+n)
+            result.extend((None if t_end is None else
+                           t_end - (origin+n-r)/ROWS_PER_SEC, lag)
+                          for r in range(row, finish))
+            row = finish
+            index += 1
+        if row != stop:
+            return tuple((self.row_time(r), self.row_lag(r))
+                         for r in range(start, stop))
+        return tuple(result)
+
+    def _rows_band(self, start, n, x_left, x_right):
+        """Copy only requested sensor columns from the fixed-size history.
+
+        Same pixels as ``_rows(start, n)[:, x_left:x_right]``, including
+        background filling for unavailable rows. The cut worker owns the
+        returned array and cannot read mutable camera history later.
+        """
+        if not 0 <= x_left < x_right <= self.full_bg.shape[0]:
+            raise ValueError('invalid column window')
+        out = np.repeat(self.full_bg[None, x_left:x_right, :], n, axis=0)
+        lo, hi = max(start, self._history_first), min(start + n, self.total)
+        if lo >= hi:
+            return out
+        idx = (lo - self._history_first) // self.H
+        while lo < hi and idx < len(self.pieces):
+            piece = self.pieces[idx]
+            origin = self._history_first + idx * self.H
+            end = min(hi, origin + len(piece))
+            if origin <= lo < end:
+                out[lo-start:end-start] = piece[lo-origin:end-origin, x_left:x_right]
                 lo = end
             idx += 1
         return out
@@ -1595,6 +1654,18 @@ class LineCamera:
         t.start()
         self._threads.append(t)
         print("  камера готова, можно подавать предметы")
+        names = {
+            "захват",
+            "вырезание",
+            "детекция",
+            "сортировка",
+            "клапаны",
+            "сводки",
+        }
+        
+        for t in threading.enumerate():
+            if t.name in names:
+                print(f"  ПОТОК: {t.name} | TID={t.native_id}")
 
     def arm(self):
         """Ждём следующий объект: снятое раньше не считается."""
@@ -1814,7 +1885,13 @@ def sorting_metrics():
                       stream_track_max_ns=d.stream_track_max_ns,
                       stream_onrun_n=d.stream_onrun_n,
                       stream_onrun_sum_ns=d.stream_onrun_sum_ns,
-                      stream_onrun_max_ns=d.stream_onrun_max_ns)
+                      stream_onrun_max_ns=d.stream_onrun_max_ns,
+                      stream_prefilter_area=d.stream_prefilter_area,
+                      stream_prefilter_edge=d.stream_prefilter_edge,
+                      stream_tracker_indexed_rows=d._tracker.indexed_rows,
+                      stream_tracker_linear_rows=d._tracker.linear_rows,
+                      stream_tracker_index_candidates=d._tracker.index_candidates,
+                      stream_tracker_linear_candidates=d._tracker.linear_candidates)
     return result
 
 
