@@ -82,6 +82,9 @@ from valve_config import CONFIG as _LOG_CONFIG
 CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
 CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
 CUT_QUEUE_SIZE = max(1, int(CUT_CONFIG.get("cut_queue_size", 32)))
+CUT_WORKERS = int(CUT_CONFIG.get("cut_workers", 1))
+if CUT_WORKERS not in (1, 2, 3):
+    raise ValueError("processing.cut_workers должен быть 1, 2 или 3")
 # Safe A/B switches: false restores the unoptimized STREAM path.
 STREAM_TRACK_PREFILTER = bool(CUT_CONFIG.get("track_prefilter", True))
 STREAM_SNAPSHOT_BAND = bool(CUT_CONFIG.get("snapshot_band", True))
@@ -941,6 +944,21 @@ class LineCamera:
         self.cut_wait_max_ms = 0.0
         self.cut_wait_sum_ms = 0.0
         self.cut_wait_n = 0
+        # Only detector assigns job IDs. Workers finish independently, but
+        # callbacks are delivered in that original detector order.
+        self._cut_delivery_lock = threading.Lock()
+        self._cut_stats_lock = threading.Lock()
+        self._cut_job_next = 0
+        self._cut_delivery_next = 0
+        self._cut_ready = {}
+        self.cut_busy = 0
+        self.cut_busy_max = 0
+        self.cut_reorder_pending_max = 0
+        self.cut_order_wait_n = 0
+        self.cut_order_wait_sum_ms = 0.0
+        self.cut_order_wait_max_ms = 0.0
+        self.cut_profile_samples = {name: deque(maxlen=4096) for name in
+            ('ВырОч', 'Выр', 'ВырПор', 'МаскаВыр', 'Морф', 'Компон', 'Кроп')}
         self.snapshot_n = 0
         self.snapshot_sum_ns = 0
         self.snapshot_max_ns = 0
@@ -1363,12 +1381,21 @@ class LineCamera:
 
     def _emit_cut(self, det, sink, t_found, t_cut_start, objs, at_edge, entry,
                   capture_ctx=None, snapshot_ms=0.0, snapshot_cpu_ms=0.0,
-                  queued_at=None):
+                  queued_at=None, completed_at=None, job_id=None):
+        # t_cut_end = time the object becomes visible to the NPU queue.
+        # completed_at = earlier end of actual extraction (can wait for order).
         t_cut_end = time.monotonic()
-        for o in objs:
+        if completed_at is None:
+            completed_at = t_cut_end
+        order_ms = max(0.0, (t_cut_end - completed_at) * 1000)
+        for i, o in enumerate(objs, 1):
             o['t_found'] = t_found
             o['t_cut_end'] = t_cut_end
-            o['cut_ms'] = (t_cut_end - t_cut_start) * 1000
+            o['cut_ms'] = (completed_at - t_cut_start) * 1000
+            o['cut_order_wait_ms'] = order_ms
+            if job_id is not None:
+                o['cut_job_id'] = job_id
+                o['cut_component_id'] = i
             # In async mode, exclude snapshot time from the worker queue wait.
             # Previously ВырОч was measured from t_found and included the
             # snapshot; this split makes the actual bottleneck visible.
@@ -1402,27 +1429,83 @@ class LineCamera:
                   f"(всего {self.sort_errors}):")
             traceback.print_exc()
 
+    def _record_cut_profile(self, snap, wait_ms, cut_ms, order_ms):
+        """Short locked updates for diagnostics; never hold lock around CV."""
+        d = snap.get('cut_profile', {})
+        with self._cut_stats_lock:
+            for key, v in (('ВырОч', wait_ms), ('Выр', cut_ms),
+                           ('ВырПор', order_ms),
+                           ('МаскаВыр', d.get('mask_ms', 0)),
+                           ('Морф', d.get('morph_ms', 0)),
+                           ('Компон', d.get('components_ms', 0)),
+                           ('Кроп', d.get('crop_ms', 0))):
+                self.cut_profile_samples[key].append(v)
+            self.cut_order_wait_n += 1
+            self.cut_order_wait_sum_ms += order_ms
+            self.cut_order_wait_max_ms = max(self.cut_order_wait_max_ms, order_ms)
+
+    def _publish_cut(self, job_id, payload):
+        """Deliver extracted regions in detection order, including failures.
+
+        Only the short callback/hand-off is serialized; OpenCV cropping runs
+        concurrently. Missing or failed jobs publish an empty completion, so
+        no later job can wait forever for a missing sequence number.
+        """
+        with self._cut_delivery_lock:
+            self._cut_ready[job_id] = payload
+            self.cut_reorder_pending_max = max(self.cut_reorder_pending_max,
+                                               len(self._cut_ready))
+            while self._cut_delivery_next in self._cut_ready:
+                data = self._cut_ready.pop(self._cut_delivery_next)
+                self._cut_delivery_next += 1
+                if data is None:
+                    continue
+                (det, sink, snap, t_found, t_start, finished,
+                 objs, at_edge, enqueued_at, capture_ctx,
+                 snap_ms, snap_cpu_ms, wait_ms, inline) = data
+                order_ms = max(0.0, (time.monotonic() - finished) * 1000)
+                self._record_cut_profile(snap, wait_ms,
+                                         (finished - t_start) * 1000, order_ms)
+                try:
+                    self._emit_cut(det, sink, t_found, t_start,
+                                   objs, at_edge, snap['diag_entry'], capture_ctx,
+                                   snap_ms, snap_cpu_ms, enqueued_at,
+                                   completed_at=finished, job_id=self._cut_delivery_next)
+                    if not inline:
+                        self.cut_completed += 1
+                except Exception:
+                    self._cut_error()
+
     def _cut_worker(self):
-        """Morphology and cropping outside the real-time STREAM tracker."""
+        """Independent morphology/cropping with ordered publication to NPU."""
         while self._running or not self.cut_queue.empty():
             try:
-                det, sink, snap, t_found, enqueued_at, capture_ctx, snap_ms, snap_cpu_ms = self.cut_queue.get(timeout=.2)
+                (job_id, det, sink, snap, t_found, enqueued_at, capture_ctx,
+                 snap_ms, snap_cpu_ms) = self.cut_queue.get(timeout=.2)
             except queue.Empty:
                 continue
+            with self._cut_stats_lock:
+                self.cut_busy += 1
+                self.cut_busy_max = max(self.cut_busy_max, self.cut_busy)
             try:
                 t_cut_start = time.monotonic()
                 wait_ms = max(0, (t_cut_start - enqueued_at) * 1000)
-                self.cut_wait_sum_ms += wait_ms
-                self.cut_wait_n += 1
-                self.cut_wait_max_ms = max(self.cut_wait_max_ms, wait_ms)
+                with self._cut_stats_lock:
+                    self.cut_wait_sum_ms += wait_ms
+                    self.cut_wait_n += 1
+                    self.cut_wait_max_ms = max(self.cut_wait_max_ms, wait_ms)
                 objs, at_edge = det.extract_snapshot(snap)
-                self._emit_cut(det, sink, t_found, t_cut_start,
-                               objs, at_edge, snap['diag_entry'], capture_ctx,
-                               snap_ms, snap_cpu_ms, enqueued_at)
-                self.cut_completed += 1
+                completed = time.monotonic()
+                self._publish_cut(job_id, (det, sink, snap, t_found,
+                                   t_cut_start, completed, objs, at_edge,
+                                   enqueued_at, capture_ctx, snap_ms,
+                                   snap_cpu_ms, wait_ms, False))
             except Exception:
                 self._cut_error()
+                self._publish_cut(job_id, None)
             finally:
+                with self._cut_stats_lock:
+                    self.cut_busy -= 1
                 self.cut_queue.task_done()
 
     def _on_run(self, det, lo, hi):
@@ -1455,9 +1538,11 @@ class LineCamera:
                                        snap_end_ns - snap_start_ns)
             if snap is None:
                 return
+            job_id = self._cut_job_next
+            self._cut_job_next += 1
             enqueued_at = time.monotonic()
             try:
-                self.cut_queue.put_nowait((det, sink, snap, t_found,
+                self.cut_queue.put_nowait((job_id, det, sink, snap, t_found,
                                            enqueued_at, capture_ctx,
                                            snap_ms, snap_cpu_ms))
                 self.cut_enqueued += 1
@@ -1471,10 +1556,16 @@ class LineCamera:
                     print(f'  камера: очередь вырезания заполнена '
                           f'({self.cut_queue_full}); резервная синхронная вырезка')
                 t0 = time.monotonic()
-                objs, at_edge = det.extract_snapshot(snap)
-                self._emit_cut(det, sink, t_found, t0,
-                               objs, at_edge, snap['diag_entry'], capture_ctx,
-                               snap_ms, snap_cpu_ms, t0)
+                try:
+                    objs, at_edge = det.extract_snapshot(snap)
+                    finished = time.monotonic()
+                    self._publish_cut(job_id, (det, sink, snap, t_found,
+                                      t0, finished, objs, at_edge,
+                                      enqueued_at, capture_ctx, snap_ms,
+                                      snap_cpu_ms, 0.0, True))
+                except Exception:
+                    self._cut_error()
+                    self._publish_cut(job_id, None)
         except Exception:
             self._cut_error()
 
@@ -1644,10 +1735,11 @@ class LineCamera:
         background = self._collect_background()
 
         if CUT_ASYNC and STREAM_TRACKING:
-            t = threading.Thread(target=self._cut_worker, daemon=True,
-                                 name="вырезание")
-            t.start()
-            self._threads.append(t)
+            for i in range(CUT_WORKERS):
+                t = threading.Thread(target=self._cut_worker, daemon=True,
+                                     name=f"вырезание-{i+1}")
+                t.start()
+                self._threads.append(t)
 
         t = threading.Thread(target=self._detector, args=(background,),
                              daemon=True, name="детекция")
@@ -1656,7 +1748,6 @@ class LineCamera:
         print("  камера готова, можно подавать предметы")
         names = {
             "захват",
-            "вырезание",
             "детекция",
             "сортировка",
             "клапаны",
@@ -1664,7 +1755,7 @@ class LineCamera:
         }
         
         for t in threading.enumerate():
-            if t.name in names:
+            if t.name in names or t.name.startswith("вырезание-"):
                 print(f"  ПОТОК: {t.name} | TID={t.native_id}")
 
     def arm(self):
@@ -1836,6 +1927,12 @@ def reset_sorting_profile():
     cam.snapshot_max_ns = 0
     cam.cut_wait_max_ms = 0.0
     cam.cut_pending_max = 0
+    with cam._cut_stats_lock:
+        cam.cut_busy_max = cam.cut_busy
+        cam.cut_reorder_pending_max = len(cam._cut_ready)
+        cam.cut_order_wait_max_ms = 0.0
+        for values in cam.cut_profile_samples.values():
+            values.clear()
     det = cam.detector
     if det is not None and hasattr(det, 'stream_mask_max_ns'):
         det.stream_mask_max_ns = 0
@@ -1849,12 +1946,17 @@ def sorting_metrics():
     if cam is None:
         return None
     d = cam.detector
+    # Copy bounded samples under their writer lock. NumPy percentile must
+    # never iterate a deque while a cut worker appends to it.
+    with cam._cut_stats_lock:
+        cut_samples = {key: tuple(values) for key, values in cam.cut_profile_samples.items()}
     result = dict(grabbed=cam.grabbed, dropped=cam.dropped,
                   gaps=d.gaps if d else 0, recoveries=cam.recoveries,
                   sort_errors=cam.sort_errors,
                   chunk_rows=cam.chunk_rows, width=cam.width,
                   queue=cam.frames.qsize(),
                   cut_async=bool(CUT_ASYNC and STREAM_TRACKING),
+                  cut_workers=CUT_WORKERS if CUT_ASYNC and STREAM_TRACKING else 0,
                   cut_enqueued=cam.cut_enqueued,
                   cut_completed=cam.cut_completed,
                   cut_queue_full=cam.cut_queue_full,
@@ -1863,6 +1965,17 @@ def sorting_metrics():
                   cut_wait_sum_ms=cam.cut_wait_sum_ms,
                   cut_wait_max_ms=cam.cut_wait_max_ms,
                   cut_wait_n=cam.cut_wait_n,
+                  cut_busy=cam.cut_busy,
+                  cut_busy_max=cam.cut_busy_max,
+                  cut_reorder_pending=len(cam._cut_ready),
+                  cut_reorder_pending_max=cam.cut_reorder_pending_max,
+                  cut_order_wait_n=cam.cut_order_wait_n,
+                  cut_order_wait_sum_ms=cam.cut_order_wait_sum_ms,
+                  cut_order_wait_max_ms=cam.cut_order_wait_max_ms,
+                  cut_profile_quantiles={key: ((float(np.percentile(values,95)),
+                                                float(np.percentile(values,99)))
+                                               if values else (0.0, 0.0))
+                                         for key, values in cut_samples.items()},
                   snapshot_n=cam.snapshot_n,
                   snapshot_sum_ns=cam.snapshot_sum_ns,
                   snapshot_max_ns=cam.snapshot_max_ns,

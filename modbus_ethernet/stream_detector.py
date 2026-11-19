@@ -196,6 +196,8 @@ def make_stream_detector(base, cfg):
             self._current_track = None
             self._stream_bg_src = None
             self.stream_finished = 0
+            import threading
+            self._stream_counts_lock = threading.Lock()
             self.stream_emitted = 0
             self.stream_invalid = 0
             self.stream_prefilter_area = 0
@@ -304,8 +306,9 @@ def make_stream_detector(base, cfg):
                 for track in completed:
                     self.stream_finished += 1
                     if track.invalid or track.last - track.lo + 1 < min_rows:
-                        self.rejected += 1
-                        self.stream_invalid += 1
+                        with self._stream_counts_lock:
+                            self.rejected += 1
+                            self.stream_invalid += 1
                         self._diag_track(track, 'too_long' if track.invalid else 'short')
                         continue
                     if track_prefilter:
@@ -317,8 +320,9 @@ def make_stream_detector(base, cfg):
                         max_area = (track.x1 - track.x0) * (track.last - track.lo + 1)
                         if max_area < min_area:
                             self.stream_prefilter_area += 1
-                            self.stream_empty += 1
-                            self.rejected += 1
+                            with self._stream_counts_lock:
+                                self.stream_empty += 1
+                                self.rejected += 1
                             self._diag_track(track, 'prefilter_area', max_area=max_area)
                             continue
                         # If the ENTIRE raw bounding box is within the
@@ -326,8 +330,9 @@ def make_stream_detector(base, cfg):
                         # pass the unchanged edge test either.
                         if track.x1 <= x0 + edge or track.x0 >= x1 - edge:
                             self.stream_prefilter_edge += 1
-                            self.stream_empty += 1
-                            self.rejected += 1
+                            with self._stream_counts_lock:
+                                self.stream_empty += 1
+                                self.rejected += 1
                             self._diag_track(track, 'prefilter_edge')
                             continue
                     if self.on_run is not None:
@@ -366,8 +371,9 @@ def make_stream_detector(base, cfg):
             if track is None:
                 return None
             if lo < self._history_first or hi > self.total:
-                self.rejected += 1
-                self.stream_invalid += 1
+                with self._stream_counts_lock:
+                    self.rejected += 1
+                    self.stream_invalid += 1
                 self._diag_track(track, 'history_missing')
                 return None
             left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
@@ -402,12 +408,16 @@ def make_stream_detector(base, cfg):
             left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
             start = lo - halo
             stop = hi + halo
+            profile_t0 = perf_counter_ns()
             mask = np.zeros((stop-start, right-left), np.uint8)
             for row, a, b in track.runs:
                 mask[row-start, a-left:b-left] = 255
+            profile_t1 = perf_counter_ns()
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.ker_open)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.ker_close)
+            profile_t2 = perf_counter_ns()
             n, lab, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            profile_t3 = perf_counter_ns()
             found, at_edge = [], 0
             rec, entry = snap['diag_rec'], snap['diag_entry']
             diagnostic = rec is not None and entry is not None
@@ -429,7 +439,8 @@ def make_stream_detector(base, cfg):
                     if component is not None: component['reason'] = 'edge'
                     continue
                 if r0 < lo or r1 > hi:
-                    self.stream_invalid += 1
+                    with self._stream_counts_lock:
+                        self.stream_invalid += 1
                     if component is not None: component['reason'] = 'outside_rows'
                     continue
                 m = (lab[y:y+h, x:x+w] == i).astype(np.uint8)
@@ -447,6 +458,7 @@ def make_stream_detector(base, cfg):
                                   area=area,crop=crop,t_front=t_front,
                                   t_last=t_last,cam_lag_ms=lag,
                                   track_id=track.ident))
+            profile_t4 = perf_counter_ns()
             if diagnostic:
                 try:
                     transitions = np.diff(np.pad(mask != 0, ((0,0),(1,1))).astype(np.int8), axis=1)
@@ -463,10 +475,15 @@ def make_stream_detector(base, cfg):
                         emitted=len(found)))
                 except Exception as e:
                     rec.error(e)
-            self.stream_emitted += len(found)
-            if not found:
-                self.stream_empty += 1
-                self.rejected += 1
+            with self._stream_counts_lock:
+                self.stream_emitted += len(found)
+                if not found:
+                    self.stream_empty += 1
+                    self.rejected += 1
+            snap['cut_profile'] = dict(mask_ms=(profile_t1-profile_t0)/1e6,
+                morph_ms=(profile_t2-profile_t1)/1e6,
+                components_ms=(profile_t3-profile_t2)/1e6,
+                crop_ms=(profile_t4-profile_t3)/1e6)
             return found, at_edge
 
         def stream_status(self):

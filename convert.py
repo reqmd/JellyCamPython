@@ -1,3 +1,4 @@
+import argparse
 import os
 import random
 
@@ -11,19 +12,22 @@ DATASET_TXT = 'dataset.txt'
 CALIB_DIR = 'calib'
 
 
-def resize_pad(image: np.ndarray, size: int, fill=(0, 0, 0)) -> np.ndarray:
-    """То же, что ResizePad в train.py, но на numpy/BGR.
-
-    Эту же функцию нужно применять в инференсе на устройстве — иначе
-    препроцессинг разойдётся с обучением.
-    """
+def resize_pad(image: np.ndarray, width: int, height: int | None = None,
+               fill=(0, 0, 0)) -> np.ndarray:
+    """Сохранение пропорций, паддинг до width x height (BGR)."""
+    height = int(height if height is not None else width)
+    width = int(width)
+    if width <= 0 or height <= 0:
+        raise ValueError('ширина и высота входа должны быть положительными')
     h, w = image.shape[:2]
-    scale = size / max(w, h)
-    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    if w <= 0 or h <= 0:
+        raise ValueError('пустое изображение')
+    scale = min(width / w, height / h)
+    new_w = min(width, max(1, round(w * scale)))
+    new_h = min(height, max(1, round(h * scale)))
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-
-    canvas = np.full((size, size, 3), fill, dtype=np.uint8)
-    y0, x0 = (size - new_h) // 2, (size - new_w) // 2
+    canvas = np.full((height, width, 3), fill, dtype=np.uint8)
+    y0, x0 = (height - new_h) // 2, (width - new_w) // 2
     canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
     return canvas
 
@@ -36,12 +40,12 @@ def make_calib_list(image_root: str,
     """Готовит калибровочный набор для INT8.
 
     Картинки прогоняются через resize_pad и сохраняются уже в размере входа
-    модели. Если отдать toolkit'у оригиналы, он приведёт их к 32x32 обычным
+    модели. Если отдать toolkit'у оригиналы, он может привести их обычным
     ресайзом и исказит пропорции — статистика для квантизации соберётся
     не по тем данным, которые модель видит в работе.
     """
-    with open(config_path, 'r') as f:
-        size = yaml.safe_load(f)['input_size'][2]   # H из [1, 3, H, W]
+    with open(config_path, 'r', encoding='utf-8') as f:
+        _, _, height, width = yaml.safe_load(f)['input_size']  # NCHW
 
     exts = {'.png', '.jpg', '.jpeg', '.bmp'}
     paths = []
@@ -67,12 +71,12 @@ def make_calib_list(image_root: str,
         dst = os.path.abspath(os.path.join(calib_dir, f'{i:04d}.png'))
         # imwrite ожидает BGR и пишет корректный по цвету файл; toolkit
         # прочитает его как RGB — ровно то, на чём обучалась модель.
-        cv2.imwrite(dst, resize_pad(image, size))
+        cv2.imwrite(dst, resize_pad(image, width, height))
         out_paths.append(dst)
 
     with open(out_txt, 'w') as f:
         f.write('\n'.join(out_paths) + '\n')
-    print(f'{out_txt}: {len(out_paths)} изображений {size}x{size} в {calib_dir}/')
+    print(f'{out_txt}: {len(out_paths)} изображений {width}x{height} в {calib_dir}/')
     return out_txt
 
 
@@ -86,7 +90,7 @@ def convert_to_rknn(config_path: str = CONFIG_PATH,
     perf=True измеряет время по слоям, но требует ПОДКЛЮЧЁННОЙ платы
     (init_runtime идёт на железо). На машине сборки оставляйте False.
     """
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     onnx_path = cfg['onnx']
@@ -155,5 +159,23 @@ def convert_to_rknn(config_path: str = CONFIG_PATH,
 
 
 if __name__ == '__main__':
-    make_calib_list('linux/data/data_for_nn/train')   # раскомментировать один раз
-    convert_to_rknn(quantize=True, perf=False)
+    parser = argparse.ArgumentParser(description='INT8-калибровка и конвертация ONNX в RKNN')
+    parser.add_argument('--config', default=CONFIG_PATH)
+    parser.add_argument('--train-dir', default='linux/data/data_for_nn/train')
+    parser.add_argument('--dataset', default=None,
+                        help='путь к txt-списку; по умолчанию зависит от размера')
+    parser.add_argument('--calib-dir', default=None,
+                        help='папка калибровочных изображений')
+    parser.add_argument('--limit', type=int, default=400)
+    parser.add_argument('--no-quantize', action='store_true')
+    parser.add_argument('--perf', action='store_true')
+    args = parser.parse_args()
+    with open(args.config, 'r', encoding='utf-8') as f:
+        _, _, h, w = yaml.safe_load(f)['input_size']
+    dataset = args.dataset or f'dataset_{w}x{h}.txt'
+    calib_dir = args.calib_dir or f'calib_{w}x{h}'
+    if not args.no_quantize:
+        make_calib_list(args.train_dir, config_path=args.config,
+                        out_txt=dataset, calib_dir=calib_dir, limit=args.limit)
+    convert_to_rknn(config_path=args.config, quantize=not args.no_quantize,
+                    dataset=dataset, perf=args.perf)

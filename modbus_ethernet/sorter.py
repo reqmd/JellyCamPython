@@ -149,19 +149,23 @@ CFG["reject_classes"] = [str(c) for c in (CFG["reject_classes"] or [])]
 # Сеть
 # --------------------------------------------------------------------------
 
-def resize_pad(image, size, fill=(0, 0, 0)):
-    """
-    Ресайз по длинной стороне и паддинг до квадрата - тот же, что в
-    linux/train.py и linux/test.py. Иначе сеть увидит не то, на чём
-    училась.
-    """
+def resize_pad(image: np.ndarray, width: int, height: int | None = None,
+               fill=(0, 0, 0)) -> np.ndarray:
+    """Сохранение пропорций, паддинг до width x height (BGR)."""
+    height = int(height if height is not None else width)
+    width = int(width)
+    if width <= 0 or height <= 0:
+        raise ValueError('ширина и высота входа должны быть положительными')
     h, w = image.shape[:2]
-    scale = size / max(w, h)
-    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((size, size, 3), fill, dtype=np.uint8)
-    y0, x0 = (size - nh) // 2, (size - nw) // 2
-    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    if w <= 0 or h <= 0:
+        raise ValueError('пустое изображение')
+    scale = min(width / w, height / h)
+    new_w = min(width, max(1, round(w * scale)))
+    new_h = min(height, max(1, round(h * scale)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((height, width, 3), fill, dtype=np.uint8)
+    y0, x0 = (height - new_h) // 2, (width - new_w) // 2
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
     return canvas
 
 
@@ -188,7 +192,15 @@ class Classifier:
         with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
 
-        self.size = int(cfg["input_size"][2])
+        # YAML: [N, C, H, W]. Раньше предполагался квадратный вход.
+        shape = cfg["input_size"]
+        if len(shape) != 4 or int(shape[1]) != 3:
+            raise ValueError(f"неожиданный вход NCHW: {shape}")
+        self.height = int(shape[2])
+        self.width = int(shape[3])
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f"некорректный вход NCHW: {shape}")
+        self.size = self.width  # обратная совместимость с внешними вызовами
         self.classes = list(cfg["classes"])
         model = cfg["rknn"]
         if not os.path.isabs(model):
@@ -210,7 +222,7 @@ class Classifier:
 
         # Первый вывод после загрузки в разы медленнее остальных: NPU
         # прогревается. Делаем это сразу, иначе опоздает первый предмет.
-        dummy = np.zeros((1, self.size, self.size, 3), np.uint8)
+        dummy = np.zeros((1, self.height, self.width, 3), np.uint8)
         for _ in range(10):
             self.rknn.inference(inputs=[dummy])
         t = time.monotonic()
@@ -227,7 +239,7 @@ class Classifier:
         which device or lock caused a long call.
         """
         start = time.perf_counter_ns()
-        padded = resize_pad(crop_bgr, self.size)
+        padded = resize_pad(crop_bgr, self.width, self.height)
         rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
         inp = np.expand_dims(rgb, 0)
         before_rknn = time.perf_counter_ns()
@@ -398,6 +410,9 @@ class _Stats:
     def reset(self):
         self.seen = 0
         self.queued = 0        # объектов принято в очередь NPU
+        self.npu_pending = 0  # individual crops, including current queue bundle
+        self.npu_peak = 0
+        self.npu_bundle_peak = 0
         self.by_class = {}
         self.rejected = 0       # поставлены в очередь клапанов (не факт отбивания)
         self.low_conf = 0
@@ -412,7 +427,7 @@ class _Stats:
         self.errors = 0
         self.no_time = 0
         self.latency = []
-        self.parts = {k: [] for k in ("Сбор", "Дет", "КамОч", "КамОчЗак", "Возраст", "ВозрастЗак", "Сним", "СнимCPU", "ВырОч", "Выр", "Оч", "NPU", "Подг", "RKNN", "Рез", "Проч")}
+        self.parts = {k: [] for k in ("Сбор", "Дет", "КамОч", "КамОчЗак", "Возраст", "ВозрастЗак", "Сним", "СнимCPU", "ВырОч", "Выр", "ВырПор", "Оч", "NPU", "Подг", "RKNN", "Рез", "Проч")}
         self.spi_late = []      # отклонение начала вызова SPI от due, со знаком
 
     def short(self):
@@ -427,6 +442,7 @@ class _Stats:
             ("без модели", self.unknown), ("ошибки", self.errors)) if value]
         if bad:
             text += " | " + " ".join(bad)
+        text += f" | NPUоч пик={self.npu_peak} тек={self.npu_pending}"
         if self.latency:
             text += (f" | Итог сред={np.mean(self.latency):.2f} "
                      f"p95={np.percentile(self.latency, 95):.2f} "
@@ -450,14 +466,17 @@ class _Stats:
                  f"  Отказы: низкая уверенность={self.low_conf} вне клапанов={self.no_valve} "
                  f"край={self.at_edge} очередь полна={self.dropped} без модели={self.unknown} "
                  f"ошибки={self.errors} без метки времени={self.no_time}",
-                 "  ВРЕМЯ, мс       СРЕДНЕЕ      P95      МАКС"]
+                 f"  ОЧЕРЕДЬ NPU: пик объектов={self.npu_peak} "
+                 f"пик пакетов={self.npu_bundle_peak} осталось={self.npu_pending}",
+                 "  ВРЕМЯ, мс       СРЕДНЕЕ      P95      P99      МАКС"]
         for name, values in [*self.parts.items(), ("ИТОГ", self.latency),
                              ("SPI откл.", self.spi_late)]:
             if values:
                 lines.append(f"  {name:<14} {np.mean(values):8.2f} "
-                             f"{np.percentile(values, 95):8.2f} {max(values):8.2f}")
+                             f"{np.percentile(values, 95):8.2f} "
+                             f"{np.percentile(values, 99):8.2f} {max(values):8.2f}")
             else:
-                lines.append(f"  {name:<14} {'—':>8} {'—':>8} {'—':>8}")
+                lines.append(f"  {name:<14} {'—':>8} {'—':>8} {'—':>8} {'—':>8}")
         lines.append(f"  SPI: успешных кадров={self.fired} | ошибок={self.spi_errors}")
         return "\n".join(lines)
 
@@ -488,13 +507,23 @@ def _camera_summary(before, after):
     if after.get('cut_async'):
         ncut = delta('cut_wait_n')
         wms = delta('cut_wait_sum_ms')
-        text += (f"\n  ВЫРЕЗАНИЕ: принято={delta('cut_enqueued')} "
+        text += (f"\n  ВЫРЕЗАНИЕ: workers={after.get('cut_workers', 1)} "
+                 f"принято={delta('cut_enqueued')} "
                  f"готово={delta('cut_completed')} "
                  f"резервных={delta('cut_queue_full')} "
                  f"в очереди={after.get('cut_queue', 0)} "
                  f"макс очередь={after.get('cut_pending_max', 0)} "
                  f"ожидание сред={wms/ncut if ncut else 0:.2f} мс "
-                 f"макс={after.get('cut_wait_max_ms', 0):.2f} мс")
+                 f"макс={after.get('cut_wait_max_ms', 0):.2f} мс "
+                 f"занято={after.get('cut_busy', 0)}/пик={after.get('cut_busy_max', 0)} "
+                 f"переупорядочено ожидание={after.get('cut_reorder_pending', 0)}"
+                 f"/пик={after.get('cut_reorder_pending_max', 0)} "
+                 f"ожидание порядка макс={after.get('cut_order_wait_max_ms', 0):.2f} мс")
+        profile = after.get('cut_profile_quantiles') or {}
+        if profile:
+            text += ("\n  ВЫРЕЗАНИЕ P95/P99 мс (*последние до 4096 заданий): " +
+                     " ".join(f"{name}={pair[0]:.2f}/{pair[1]:.2f}"
+                              for name, pair in profile.items()))
     if "stream_pieces" in after:
         n = delta('stream_pieces')
         text += (f"\n  STREAM: завершено={delta('stream_finished')} "
@@ -659,7 +688,7 @@ def _start():
           f"LINES={line_camera.LINES} PROC_ROWS={line_camera.PROC_ROWS} | "
           f"задано {line_camera.ROWS_PER_SEC:g} строк/с | "
           f"выдержка={line_camera.EXPOSURE_MS:g} мс")
-    print(f"  Вырезание: {'поток + очередь' if (line_camera.CUT_ASYNC and line_camera.STREAM_TRACKING) else 'синхронно'} | "
+    print(f"  Вырезание: {f'{line_camera.CUT_WORKERS} worker + очередь' if (line_camera.CUT_ASYNC and line_camera.STREAM_TRACKING) else 'синхронно'} | "
           f"очередь={line_camera.CUT_QUEUE_SIZE} | "
           f"NPU-предупреждение от {NPU_WARN_MS:g} мс | "
           f"профиль стадий={'ON' if PIPELINE_TIMING else 'OFF'}")
@@ -671,7 +700,7 @@ def _start():
           f"полоса снимка={'ON' if line_camera.STREAM_SNAPSHOT_BAND else 'OFF'} "
           f"индекс TRACK={'ON' if line_camera.STREAM_TRACK_INDEX else 'OFF'}")
     model = _classifier
-    print(f"  Модель: {f'{model.size}x{model.size} | классы={model.classes}' if model is not None else 'не готова'} "
+    print(f"  Модель: {f'{model.width}x{model.height} | классы={model.classes}' if model is not None else 'не готова'} "
           f"| отбиваем={reject}")
     print(f"  Клапаны: {len(zones)} | задержка={_delay_ms:.2f} мс | импульс={_duration_ms:.2f} мс "
           f"| инверсия={'ON' if CFG['mirror_x'] else 'OFF'}")
@@ -788,6 +817,10 @@ def _on_objects(objs, at_edge, session):
         try:
             _objects.put_nowait((session, time.monotonic(), objs))
             _count("queued", len(objs))
+            for stats in (_stats, _total):
+                stats.npu_pending += len(objs)
+                stats.npu_peak = max(stats.npu_peak, stats.npu_pending)
+                stats.npu_bundle_peak = max(stats.npu_bundle_peak, _objects.qsize())
         except queue.Full:
             _count("dropped", len(objs))
 
@@ -847,6 +880,8 @@ def _decide(obj, received, session):
         parts["Выр"] = obj["cut_ms"]
     if obj.get("cut_wait_ms") is not None:
         parts["ВырОч"] = obj['cut_wait_ms']
+    if obj.get('cut_order_wait_ms') is not None:
+        parts['ВырПор'] = obj['cut_order_wait_ms']
     if PIPELINE_TIMING:
         # Do not shadow `name`: it is the RKNN class label used to decide
         # whether the object must be rejected by the valves.
@@ -874,7 +909,7 @@ def _decide(obj, received, session):
             # The detailed NPU stages are a *breakdown* of NPU, not extra
             # elapsed time; do not subtract them twice from the residual.
             parts["Проч"] = lat - sum(parts.get(k, 0) for k in
-                ("Сбор", "Дет", "Сним", "ВырОч", "Выр", "Оч", "NPU"))
+                ("Сбор", "Дет", "Сним", "ВырОч", "Выр", "ВырПор", "Оч", "NPU"))
         _count("seen")
         _stats.by_class[name] = _stats.by_class.get(name, 0) + 1
         _total.by_class[name] = _total.by_class.get(name, 0) + 1
@@ -936,7 +971,10 @@ def _decide(obj, received, session):
                 stages += f" Проч={fmt('Проч')}"
             total = f"{lat:.2f}" if actual_front is not None else "—"
             tail = f" | клапаны={_span(hit)} [{where}]" if LOG_POSITIONS else ""
-            print(f"#{number:04d} | Кл={name} {conf*100:.1f}% | {stages} | "
+            job = obj.get('cut_job_id')
+            job_label = (f" | Зад={job}/{obj.get('cut_component_id', 1)}"
+                         if job is not None else "")
+            print(f"#{number:04d}{job_label} | Кл={name} {conf*100:.1f}% | {stages} | "
                   f"Итог={total} мс | {status}{tail}")
 
 
@@ -946,8 +984,8 @@ def _worker():
     try:
         _classifier = Classifier()
         print(f"сортировка: модель {_classifier.model}, классы "
-              f"{_classifier.classes}, вход {_classifier.size}x"
-              f"{_classifier.size}, вывод {_classifier.infer_ms:.1f} мс")
+              f"{_classifier.classes}, вход {_classifier.width}x"
+              f"{_classifier.height}, вывод {_classifier.infer_ms:.1f} мс")
     except Exception as e:
         _classifier_error = str(e) or type(e).__name__
         print(f"сортировка: сеть недоступна - {_classifier_error}")
@@ -959,6 +997,10 @@ def _worker():
             session = None
         if session is not None and _active and session == _session:
             for obj in objs:
+                with _lock:
+                    if _active and session == _session:
+                        for stats in (_stats, _total):
+                            stats.npu_pending = max(0, stats.npu_pending - 1)
                 try:
                     _decide(obj, received, session)
                 except Exception as e:

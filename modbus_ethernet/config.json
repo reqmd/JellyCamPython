@@ -50,7 +50,7 @@
     "summary_sec": 10,
     "log_positions": false,
     "log_detector_debug": false,
-    "npu_warn_ms": 5.0,
+    "npu_warn_ms": 4.0,
     "npu_detail_each": false,
     "pipeline_timing": true,
     "pipeline_timing_each": true
@@ -74,6 +74,7 @@
     "cut_queue_size": 32,
     "track_prefilter": true,
     "snapshot_band": true,
-    "tracker_index": true
+    "tracker_index": true,
+    "cut_workers": 1
   }
 }
