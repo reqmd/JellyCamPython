@@ -443,15 +443,23 @@ def make_stream_detector(base, cfg):
                         self.stream_invalid += 1
                     if component is not None: component['reason'] = 'outside_rows'
                     continue
-                m = (lab[y:y+h, x:x+w] == i).astype(np.uint8)
-                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                filled = np.zeros_like(m)
-                cv2.drawContours(filled, cnts, -1, 1, thickness=cv2.FILLED)
-                crop = rows[r0-lo:r1-lo,
-                            a-snap.get('x_offset', 0):b-snap.get('x_offset', 0)].copy()
+                offset = snap.get('x_offset', 0)
+                roi = rows[r0-lo:r1-lo, a-offset:b-offset]
                 if median_kernel > 1:
-                    crop = cv2.medianBlur(crop, median_kernel)
-                crop[filled == 0] = 0
+                    roi = cv2.medianBlur(roi, median_kernel)
+                if area == w * h:
+                    crop = roi if median_kernel > 1 else roi.copy()
+                else:
+                    # With one foreground label the binary mask already isolates it.
+                    if n == 2:
+                        component_mask = mask[y:y+h, x:x+w]
+                    else:
+                        component_mask = (lab[y:y+h, x:x+w] == i).astype(np.uint8)
+                    contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL,
+                                                   cv2.CHAIN_APPROX_SIMPLE)
+                    filled = np.zeros((h, w), np.uint8)
+                    cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
+                    crop = cv2.copyTo(roi, filled)
                 t_front, lag = snap['timings'][r0-lo]
                 t_last, _ = snap['timings'][r1-1-lo]
                 found.append(dict(x0=a,x1=b,row0=r0,row1=r1,
@@ -496,3 +504,4 @@ def make_stream_detector(base, cfg):
                     f'track={self.stream_track_ns/n/1e6:.3f} ms/piece')
 
     return StreamingObjectDetector
+

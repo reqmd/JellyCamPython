@@ -850,6 +850,22 @@ def _save_crop(crop, name, conf):
     _saved += 1
 
 
+def _cut_detail(obj, due, front):
+    profile = obj.get("cut_profile") or {}
+    fields = []
+    for label, key in (("МаскаВыр", "mask_ms"), ("Морф", "morph_ms"),
+                       ("Компон", "components_ms"), ("Кроп", "crop_ms")):
+        value = profile.get(key)
+        fields.append(f"{label}={value:.2f}" if value is not None else f"{label}=—")
+    for label, key in (("ОстВход", "cut_started_at"), ("ОстВыход", "cut_finished_at")):
+        stamp = obj.get(key)
+        if front is None or stamp is None:
+            fields.append(f"{label}=—")
+        else:
+            fields.append(f"{label}={(due - stamp) * 1000:+.2f}")
+    return " [" + " ".join(fields) + "]"
+
+
 def _decide(obj, received, session):
     """Классификация и прежняя политика планирования; новый только лог."""
     with _lock:
@@ -974,6 +990,7 @@ def _decide(obj, received, session):
             if PIPELINE_TIMING and PIPELINE_TIMING_EACH:
                 stages += ' {' + ' '.join(f'{k}={fmt(k)}' for k in
                                        ("КамОч", "КамОчЗак", "Возраст", "Сним")) + '}'
+                stages += _cut_detail(obj, due, actual_front)
             if NPU_DETAIL_EACH and npu_detail:
                 stages += ' [' + ' '.join(f'{k}={fmt(k)}' for k in
                                       ("Подг", "RKNN", "Рез")) + ']'
@@ -1118,3 +1135,4 @@ def prepare():
         t = threading.Thread(target=target, daemon=True, name=name)
         t.start()
         _threads.append(t)
+

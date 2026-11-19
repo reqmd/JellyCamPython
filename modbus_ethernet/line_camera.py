@@ -1381,7 +1381,7 @@ class LineCamera:
 
     def _emit_cut(self, det, sink, t_found, t_cut_start, objs, at_edge, entry,
                   capture_ctx=None, snapshot_ms=0.0, snapshot_cpu_ms=0.0,
-                  queued_at=None, completed_at=None, job_id=None):
+                  queued_at=None, completed_at=None, job_id=None, cut_profile=None):
         # t_cut_end = time the object becomes visible to the NPU queue.
         # completed_at = earlier end of actual extraction (can wait for order).
         t_cut_end = time.monotonic()
@@ -1401,6 +1401,9 @@ class LineCamera:
             # snapshot; this split makes the actual bottleneck visible.
             o['cut_wait_ms'] = max(0, (t_cut_start - (queued_at or t_found)) * 1000)
             if PIPELINE_TIMING:
+                o['cut_started_at'] = t_cut_start
+                o['cut_finished_at'] = completed_at
+                o['cut_profile'] = cut_profile
                 o['snapshot_ms'] = snapshot_ms
                 o['snapshot_cpu_ms'] = snapshot_cpu_ms
                 if capture_ctx is not None:
@@ -1470,7 +1473,8 @@ class LineCamera:
                     self._emit_cut(det, sink, t_found, t_start,
                                    objs, at_edge, snap['diag_entry'], capture_ctx,
                                    snap_ms, snap_cpu_ms, enqueued_at,
-                                   completed_at=finished, job_id=self._cut_delivery_next)
+                                   completed_at=finished, job_id=self._cut_delivery_next,
+                                   cut_profile=snap.get('cut_profile'))
                     if not inline:
                         self.cut_completed += 1
                 except Exception:
