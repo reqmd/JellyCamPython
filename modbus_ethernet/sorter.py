@@ -45,6 +45,7 @@ import cv2
 import numpy as np
 
 import valves
+from gc_monitor import SessionGC, rss_mib
 import diagnostic_capture as diag
 from valve_config import (CONFIG, HERE, REGISTERS, VALVE_BASE,
                           VALVE_COUNT_REG)
@@ -380,6 +381,7 @@ def valves_for(x0, x1, zones):
 # --------------------------------------------------------------------------
 
 _lock = threading.RLock()  # события и согласованные счётчики сессии
+_gc_monitor = SessionGC(CONFIG.get("gc", {}))
 _active = False
 _session = 0                 # номер сортировки: старые события не трогать
 _next_mode = None            # "sorting" / "shooting" - что подготовлено
@@ -678,6 +680,7 @@ def _start():
         _camera_base = line_camera.sorting_metrics()
         _pipeline_previous = _camera_base
         _logger_base = logger.dropped_count()
+        _gc_monitor.start()
         _active = True
     session = _session
     zones = valve_zones()
@@ -745,9 +748,16 @@ def _stop(why):
         total, before = _total, _camera_base
         inflight = _spi_inflight
         logs_dropped = logger.dropped_count() - _logger_base
+        _gc_monitor.stop()
     print(f"=== СОРТИРОВКА: СТОП ({why}) | сессия={session} ===")
     print(f"  Длительность: {elapsed:.2f} сек")
     print(total.line())
+    if total.latency:
+        within = sum(value <= 10 for value in total.latency)
+        n = len(total.latency)
+        print(f"GC AB decision_le_10ms={within}/{n} ({100*within/n:.2f}%) "
+              f"p95_ms={np.percentile(total.latency, 95):.2f} "
+              f"p99_ms={np.percentile(total.latency, 99):.2f} no_time={total.no_time}")
     print(_camera_summary(before, after))
     print(f"  На стоп: отменено событий клапанов={cancelled} "
           f"SPI в работе={inflight} | пропущено строк лога={logs_dropped}")
@@ -1024,6 +1034,8 @@ def _summary_worker():
             with _lock:
                 now = time.monotonic()
                 if now - _summary_at >= SUMMARY_SEC:
+                    if _active:
+                        print(f"GC RSS session={_session} MiB={rss_mib():.2f}")
                     if LOG_SUMMARY and _active and (_stats.seen or _stats.dropped or _stats.spi_errors or _stats.errors or _stats.at_edge or _stats.fired):
                         snapshot = (_session, now - _summary_at, _stats)
                     _stats = _Stats()

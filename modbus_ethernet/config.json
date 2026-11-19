@@ -1,4 +1,7 @@
 {
+  "gc": {
+    "mode": "normal"
+  },
   "registers": {
     "camera_type": 41006,
     "fov_left": 20106,
@@ -75,6 +78,6 @@
     "track_prefilter": true,
     "snapshot_band": true,
     "tracker_index": true,
-    "cut_workers": 1
+    "cut_workers": 2
   }
 }
