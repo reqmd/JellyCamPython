@@ -84,6 +84,11 @@ SORT_DEFAULTS = {
     "min_confidence": 0.0,
     # Ядро NPU: 0, 1, 2, или -1 - пусть выбирает сам.
     "npu_core": 0,
+    # Столько полных классификаций выполнить на каждом ядре до сортировки.
+    "npu_warmup_calls": 200,
+    # Необязательно: путь к настоящей вырезке для прогрева (от каталога сервера).
+    # Если не задан, используется искусственная вырезка похожей формы.
+    "npu_warmup_crop": "",
     # Длина такта задержки (регистр 11), мс. Приложение задаёт задержку
     # не в миллисекундах, а в тактах по 250 мкс: 10 - это 2,5 мс.
     "delay_tick_ms": 0.25,
@@ -138,6 +143,7 @@ if (not isinstance(NPU_CORES, list) or not NPU_CORES
         or (-1 in NPU_CORES and len(NPU_CORES) > 1)):
     raise ValueError("sorting.npu_cores: задайте разные ядра 0..2 или [-1]")
 _ready_cores = set()
+_init_done_cores = set()
 LOG_CFG = dict(CONFIG.get("logging") or {})
 LOG_OBJECTS = bool(LOG_CFG.get("log_objects", CFG["log_each"]))
 LOG_SUMMARY = bool(LOG_CFG.get("log_summary", True))
@@ -237,6 +243,44 @@ class Classifier:
         for _ in range(20):
             self.rknn.inference(inputs=[dummy])
         self.infer_ms = (time.monotonic() - t) / 20 * 1000
+
+    def warmup(self, core):
+        """Прогнать обычный путь классификации до приёма объектов."""
+        calls = int(CFG["npu_warmup_calls"])
+        if calls < 0:
+            raise ValueError("sorting.npu_warmup_calls должно быть >= 0")
+        if not calls:
+            return
+
+        crop_path = CFG["npu_warmup_crop"]
+        if crop_path:
+            if not os.path.isabs(crop_path):
+                crop_path = os.path.join(HERE, crop_path)
+            crop = cv2.imread(crop_path, cv2.IMREAD_COLOR)
+            if crop is None:
+                raise RuntimeError(f"не удалось прочитать вырезку прогрева: {crop_path}")
+        else:
+            # Форма и яркость близки к реальному зерну на чёрном фоне.
+            crop = np.zeros((16, 48, 3), dtype=np.uint8)
+            cv2.ellipse(crop, (24, 8), (17, 5), 0, 0, 360,
+                        (70, 170, 230), -1)
+
+        start = time.perf_counter_ns()
+        max_rknn_ms = 0.0
+        max_call = 0
+        slow = 0
+        for i in range(1, calls + 1):
+            _, _, timings = self.classify_timed(crop)
+            elapsed = timings['Подг'] + timings['RKNN'] + timings['Рез']
+            if elapsed > 3.0:
+                slow += 1
+            if timings['RKNN'] > max_rknn_ms:
+                max_rknn_ms = timings['RKNN']
+                max_call = i
+        total_ms = (time.perf_counter_ns() - start) / 1e6
+        print(f"NPU WARMUP core={core} calls={calls} total_ms={total_ms:.1f} "
+              f"slow_over_3ms={slow} max_rknn_ms={max_rknn_ms:.2f} "
+              f"max_call={max_call}")
 
     def classify_timed(self, crop_bgr):
         """(class, confidence, timings): preparation / RKNN / result, ms.
@@ -388,6 +432,7 @@ def valves_for(x0, x1, zones):
 # --------------------------------------------------------------------------
 
 _lock = threading.RLock()  # события и согласованные счётчики сессии
+_init_cv = threading.Condition(_lock)
 _gc_monitor = SessionGC(CONFIG.get("gc", {}))
 _active = False
 _session = 0                 # номер сортировки: старые события не трогать
@@ -675,8 +720,11 @@ def _start():
         return
     import logger
     with _lock:
-        if len(NPU_CORES) > 1 and len(_ready_cores) != len(NPU_CORES):
-            print(f"сортировка: старт отложен, готовы ядра {sorted(_ready_cores)} из {NPU_CORES}; повторите старт после прогрева")
+        if len(_ready_cores) != len(NPU_CORES):
+            print(f"сортировка: старт отложен, прогреты ядра {sorted(_ready_cores)} "
+                  f"из {NPU_CORES}; " +
+                  (f"ошибка: {_classifier_error}; исправьте её и перезапустите сервер"
+                   if _classifier_error else "повторите старт после прогрева"))
             return
         _session += 1
         _events.clear()
@@ -1031,6 +1079,7 @@ def _worker(core):
     global _classifier, _classifier_error
     try:
         model = Classifier(core)
+        model.warmup(core)
         with _lock:
             if core == NPU_CORES[0]:
                 _classifier = model
@@ -1038,11 +1087,14 @@ def _worker(core):
         print(f"NPU READY core={core} model={model.model} input={model.width}x{model.height} "
               f"infer_ms={model.infer_ms:.2f}")
     except Exception as e:
-        model = None
-        _classifier_error = str(e) or type(e).__name__
-        print(f"сортировка: сеть недоступна core={core}: {_classifier_error}")
-        if len(NPU_CORES) > 1:
-            return
+        with _lock:
+            _classifier_error = f"core={core}: {str(e) or type(e).__name__}"
+        print(f"сортировка: сеть недоступна {_classifier_error}")
+        return
+    finally:
+        with _init_cv:
+            _init_done_cores.add(core)
+            _init_cv.notify_all()
 
     while True:
         try:
@@ -1164,3 +1216,10 @@ def prepare():
         t = threading.Thread(target=target, args=args, daemon=True, name=name)
         t.start()
         _threads.append(t)
+    # Сначала прогреваем модели, затем сервер начинает принимать команды.
+    # При зависшем драйвере ожидание ограничено; _start() всё равно закрыт.
+    with _init_cv:
+        if not _init_cv.wait_for(lambda: len(_init_done_cores) == len(NPU_CORES),
+                                 timeout=15.0):
+            print(f"сортировка: ожидание прогрева NPU >15 с; готовы "
+                  f"{sorted(_ready_cores)} из {NPU_CORES}")
