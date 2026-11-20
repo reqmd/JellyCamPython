@@ -29,7 +29,8 @@
       "0"
     ],
     "mirror_x": true,
-    "save_dir": ""
+    "save_dir": "",
+    "npu_cores": [0, 1]
   },
   "camera": {
     "flat_field": true,
@@ -55,8 +56,8 @@
     "log_detector_debug": false,
     "npu_warn_ms": 4.0,
     "npu_detail_each": false,
-    "pipeline_timing": true,
-    "pipeline_timing_each": true
+    "pipeline_timing": false,
+    "pipeline_timing_each": false
   },
   "diagnostics": {
     "enabled": false,

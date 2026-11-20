@@ -131,6 +131,13 @@ SORT_DEFAULTS = {
 
 CFG = dict(SORT_DEFAULTS)
 CFG.update(CONFIG.get("sorting") or {})
+NPU_CORES = CFG.get("npu_cores", [int(CFG["npu_core"])])
+if (not isinstance(NPU_CORES, list) or not NPU_CORES
+        or any(type(core) is not int or core not in (-1, 0, 1, 2) for core in NPU_CORES)
+        or len(set(NPU_CORES)) != len(NPU_CORES)
+        or (-1 in NPU_CORES and len(NPU_CORES) > 1)):
+    raise ValueError("sorting.npu_cores: задайте разные ядра 0..2 или [-1]")
+_ready_cores = set()
 LOG_CFG = dict(CONFIG.get("logging") or {})
 LOG_OBJECTS = bool(LOG_CFG.get("log_objects", CFG["log_each"]))
 LOG_SUMMARY = bool(LOG_CFG.get("log_summary", True))
@@ -173,7 +180,7 @@ def resize_pad(image: np.ndarray, width: int, height: int | None = None,
 class Classifier:
     """Модель .rknn на NPU. Создавать и вызывать из одного потока."""
 
-    def __init__(self):
+    def __init__(self, core=None):
         try:
             import yaml
         except ImportError:
@@ -216,7 +223,7 @@ class Classifier:
         if self.rknn.load_rknn(model) != 0:
             raise RuntimeError(f"load_rknn не открыл {model}")
         if self.rknn.init_runtime(
-                core_mask=cores.get(int(CFG["npu_core"]),
+                core_mask=cores.get(int(CFG["npu_core"]) if core is None else core,
                                     RKNNLite.NPU_CORE_0)) != 0:
             raise RuntimeError("init_runtime не запустил NPU")
         self.model = model
@@ -668,6 +675,9 @@ def _start():
         return
     import logger
     with _lock:
+        if len(NPU_CORES) > 1 and len(_ready_cores) != len(NPU_CORES):
+            print(f"сортировка: старт отложен, готовы ядра {sorted(_ready_cores)} из {NPU_CORES}; повторите старт после прогрева")
+            return
         _session += 1
         _events.clear()
         _saved = 0
@@ -825,7 +835,15 @@ def _on_objects(objs, at_edge, session):
         if not objs:
             return
         try:
-            _objects.put_nowait((session, time.monotonic(), objs))
+            received = time.monotonic()
+            if len(NPU_CORES) == 1:
+                _objects.put_nowait((session, received, objs))
+            else:
+                # Producers hold _lock. Consumers can only increase free capacity.
+                if len(objs) > _objects.maxsize - _objects.qsize():
+                    raise queue.Full
+                for obj in objs:
+                    _objects.put_nowait((session, received, (obj,)))
             _count("queued", len(objs))
             for stats in (_stats, _total):
                 stats.npu_pending += len(objs)
@@ -835,19 +853,23 @@ def _on_objects(objs, at_edge, session):
             _count("dropped", len(objs))
 
 
-def _save_crop(crop, name, conf):
+def _save_crop(crop, name, conf, session):
     global _saved
-    if not CFG["save_dir"] or _saved >= int(CFG["save_limit"]):
+    if not CFG["save_dir"]:
         return
+    with _lock:
+        if session != _session or not _active or _saved >= int(CFG["save_limit"]):
+            return
+        index = _saved
+        _saved += 1
     d = CFG["save_dir"]
     if not os.path.isabs(d):
         d = os.path.join(HERE, d)
     d = os.path.join(d, name)
     os.makedirs(d, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    cv2.imwrite(os.path.join(d, f"{stamp}_{_saved:04d}_{conf:.2f}.png"),
+    cv2.imwrite(os.path.join(d, f"{stamp}_s{session}_{index:04d}_{conf:.2f}.png"),
                 crop)
-    _saved += 1
 
 
 def _cut_detail(obj, due, front):
@@ -866,12 +888,11 @@ def _cut_detail(obj, due, front):
     return " [" + " ".join(fields) + "]"
 
 
-def _decide(obj, received, session):
+def _decide(obj, received, session, model, core):
     """Классификация и прежняя политика планирования; новый только лог."""
     with _lock:
         if not _active or session != _session:
             return
-        model = _classifier
         if model is None:
             _count("seen")
             _count("unknown")
@@ -891,7 +912,7 @@ def _decide(obj, received, session):
               f'RKNN={npu_detail.get("RKNN", nn_ms):.2f} '
               f'результат={npu_detail.get("Рез", 0):.2f} '
               f'CPU в RKNN={npu_detail.get("RKNN_CPU", 0):.2f} мс')
-    _save_crop(crop, name, conf)
+    _save_crop(crop, name, conf, session)
 
     # Срок по-прежнему отсчитывается от t_front. Измеряем решение
     # после вычисления клапанов, непосредственно перед планированием.
@@ -1001,21 +1022,27 @@ def _decide(obj, received, session):
             job = obj.get('cut_job_id')
             job_label = (f" | Зад={job}/{obj.get('cut_component_id', 1)}"
                          if job is not None else "")
-            print(f"#{number:04d}{job_label} | Кл={name} {conf*100:.1f}% | {stages} | "
+            print(f"#{number:04d}{job_label} | Ядро={core} | Кл={name} {conf*100:.1f}% | {stages} | "
                   f"Итог={total} мс | {status}{tail}")
 
 
-def _worker():
+def _worker(core):
     """Поток сети: грузит модель один раз, затем разбирает очередь."""
     global _classifier, _classifier_error
     try:
-        _classifier = Classifier()
-        print(f"сортировка: модель {_classifier.model}, классы "
-              f"{_classifier.classes}, вход {_classifier.width}x"
-              f"{_classifier.height}, вывод {_classifier.infer_ms:.1f} мс")
+        model = Classifier(core)
+        with _lock:
+            if core == NPU_CORES[0]:
+                _classifier = model
+            _ready_cores.add(core)
+        print(f"NPU READY core={core} model={model.model} input={model.width}x{model.height} "
+              f"infer_ms={model.infer_ms:.2f}")
     except Exception as e:
+        model = None
         _classifier_error = str(e) or type(e).__name__
-        print(f"сортировка: сеть недоступна - {_classifier_error}")
+        print(f"сортировка: сеть недоступна core={core}: {_classifier_error}")
+        if len(NPU_CORES) > 1:
+            return
 
     while True:
         try:
@@ -1029,7 +1056,7 @@ def _worker():
                         for stats in (_stats, _total):
                             stats.npu_pending = max(0, stats.npu_pending - 1)
                 try:
-                    _decide(obj, received, session)
+                    _decide(obj, received, session, model, core)
                 except Exception as e:
                     with _lock:
                         if _active and session == _session:
@@ -1130,9 +1157,10 @@ def prepare():
     """При старте сервера: потоки сети и клапанов, загрузка модели."""
     if _threads:
         return
-    for target, name in ((_worker, "сортировка"), (_firer, "клапаны"),
-                         (_summary_worker, "сводки")):
-        t = threading.Thread(target=target, daemon=True, name=name)
+    jobs = [(_worker, (core,), "сортировка" if i == 0 else f"сортировка-{core}")
+            for i, core in enumerate(NPU_CORES)]
+    jobs.extend([(_firer, (), "клапаны"), (_summary_worker, (), "сводки")])
+    for target, args, name in jobs:
+        t = threading.Thread(target=target, args=args, daemon=True, name=name)
         t.start()
         _threads.append(t)
-
