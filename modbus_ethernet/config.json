@@ -30,6 +30,7 @@
     ],
     "mirror_x": true,
     "save_dir": "",
+    "npu_warmup_calls": 200,
     "npu_cores": [0, 1]
   },
   "camera": {
