@@ -31,7 +31,12 @@
     "mirror_x": true,
     "save_dir": "",
     "npu_warmup_calls": 200,
-    "npu_cores": [0, 1]
+    "npu_warmup_crop": "warmup/grain.png",
+    "npu_cores": [0, 1],
+    "npu_backend": "cpp",
+    "npu_prepare_backend": "cpp",
+    "duration_tick_ms": 0.5,
+    "ms_per_duration_unit": 0.5
   },
   "camera": {
     "flat_field": true,
@@ -57,8 +62,8 @@
     "log_detector_debug": false,
     "npu_warn_ms": 4.0,
     "npu_detail_each": false,
-    "pipeline_timing": false,
-    "pipeline_timing_each": false
+    "pipeline_timing": true,
+    "pipeline_timing_each": true
   },
   "diagnostics": {
     "enabled": false,
@@ -80,6 +85,10 @@
     "track_prefilter": true,
     "snapshot_band": true,
     "tracker_index": true,
-    "cut_workers": 2
+    "cut_workers": 2,
+    "cut_backend": "cpp",
+    "tracker_backend": "cpp",
+    "mask_capture_blocks": 0,
+    "mask_capture_dir": "mask_captures"
   }
 }

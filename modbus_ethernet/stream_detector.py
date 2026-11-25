@@ -5,7 +5,7 @@ Capture mode delegates to the original detector. Sorting uses full-resolution
 background subtraction, row runs, and local morphology on completed tracks.
 """
 from dataclasses import dataclass, field
-from time import perf_counter_ns
+from time import monotonic_ns, perf_counter_ns, thread_time_ns
 
 import cv2
 import numpy as np
@@ -64,7 +64,7 @@ class _Tracker:
         self.active.remove(b)
         self.merged += 1
 
-    def step(self, row, intervals):
+    def step(self, row, intervals, profile=None):
         """Match raw horizontal runs, preserving the original merge order.
 
         When many tracks or groups exist, use a conservative spatial index.
@@ -72,6 +72,8 @@ class _Tracker:
         so it cannot exclude a real match. The exact `_near` test and the
         original active-list order still decide every association.
         """
+        stage_t0 = perf_counter_ns() if profile is not None else 0
+        active_before = len(self.active)
         groups = []
         for a, b in intervals:
             if b - a < self.min_run:
@@ -81,6 +83,12 @@ class _Tracker:
                 groups[-1][2].append((a, b))
             else:
                 groups.append([a, b, [(a, b)]])
+
+        if profile is not None:
+            profile['groups'] = len(groups)
+            profile['active_before'] = active_before
+            profile['group_ns'] = perf_counter_ns() - stage_t0
+            stage_t0 = perf_counter_ns()
 
         for t in self.active:
             t.new_frontier.clear()
@@ -111,7 +119,16 @@ class _Tracker:
         else:
             self.linear_rows += 1
 
+        if profile is not None:
+            profile['prepare_ns'] = perf_counter_ns() - stage_t0
+            profile['indexed'] = indexed
+            profile['merged_before'] = self.merged
+            profile.update(candidate_ns=0, near_ns=0, associate_ns=0,
+                           update_ns=0, candidates=0, matches=0)
+
         for a, b, raw in groups:
+            if profile is not None:
+                stage_t0 = perf_counter_ns()
             if indexed:
                 ids = set()
                 for k in range(a // bucket_width, b // bucket_width + 1):
@@ -123,9 +140,17 @@ class _Tracker:
             else:
                 candidates = self.active
                 self.linear_candidates += len(candidates)
+            if profile is not None:
+                profile['candidate_ns'] += perf_counter_ns() - stage_t0
+                profile['candidates'] += len(candidates)
+                stage_t0 = perf_counter_ns()
             matches = [t for t in candidates
                        if self._near(a, b, t.frontier)
                        or self._near(a, b, t.new_frontier)]
+            if profile is not None:
+                profile['near_ns'] += perf_counter_ns() - stage_t0
+                profile['matches'] += len(matches)
+                stage_t0 = perf_counter_ns()
             if matches:
                 t = matches[0]
                 for other in matches[1:]:
@@ -140,6 +165,9 @@ class _Tracker:
                     alive[t.ident] = t
                     order[t.ident] = next_order
                     next_order += 1
+            if profile is not None:
+                profile['associate_ns'] += perf_counter_ns() - stage_t0
+                stage_t0 = perf_counter_ns()
             t.x0, t.x1 = min(t.x0, a), max(t.x1, b)
             t.new_frontier.append((a, b))
             t.area += sum(d - c for c, d in raw)
@@ -150,7 +178,11 @@ class _Tracker:
                 t.runs.extend((row, c, d) for c, d in raw)
             if indexed:
                 index_track(t)
+            if profile is not None:
+                profile['update_ns'] += perf_counter_ns() - stage_t0
 
+        if profile is not None:
+            stage_t0 = perf_counter_ns()
         done, keep = [], []
         for t in self.active:
             if t.new_frontier:
@@ -161,6 +193,11 @@ class _Tracker:
             else:
                 keep.append(t)
         self.active = keep
+        if profile is not None:
+            profile['finish_ns'] = perf_counter_ns() - stage_t0
+            profile['active_after'] = len(keep)
+            profile['finished'] = len(done)
+            profile['merged'] = self.merged - profile.get('merged_before', self.merged)
         return done
 
 
@@ -172,6 +209,14 @@ def make_stream_detector(base, cfg):
     threshold = int(cfg['TH'])
     edge = int(cfg['EDGE_OLD'])
     median_kernel = int(cfg['MEDIAN_KERNEL'])
+    cut_backend = str(cfg.get('CUT_BACKEND', 'python')).lower()
+    if cut_backend not in ('python', 'cpp'):
+        raise ValueError("processing.cut_backend: задайте python или cpp")
+    if cut_backend == 'cpp':
+        from cpp_cut_backend import CppCut
+        cpp_cut = CppCut()
+    else:
+        cpp_cut = None
     col_step = int(cfg['COL_STEP'])
     touch_pixels = int(cfg['TOUCH_PIXELS'])
     row_median = cfg['_row_median']
@@ -183,15 +228,27 @@ def make_stream_detector(base, cfg):
     track_prefilter = bool(cfg.get('STREAM_TRACK_PREFILTER', False))
     snapshot_band = bool(cfg.get('STREAM_SNAPSHOT_BAND', False))
     tracker_index = bool(cfg.get('STREAM_TRACK_INDEX', False))
+    capture_blocks = int(cfg.get('MASK_CAPTURE_BLOCKS', 0))
+    capture_dir = cfg.get('MASK_CAPTURE_DIR', 'mask_captures')
+    tracker_backend = str(cfg.get('TRACKER_BACKEND', 'python')).lower()
+    if tracker_backend not in ('python', 'cpp'):
+        raise ValueError('processing.tracker_backend: задайте python или cpp')
+    stream_warn_ns = (int(cfg.get('STREAM_WARN_MS', 5.0) * 1e6)
+                      if cfg.get('PIPELINE_TIMING', False) else 0)
+    camera_rows_per_sec = float(cfg.get('ROWS_PER_SEC', 0))
     # OPEN + CLOSE have a finite spatial support. Give the mask a zero halo.
     halo = 2 * (open_k // 2 + close_k // 2)
 
     class StreamingObjectDetector(base):
         def __init__(self, full_bg, piece_rows, bg_rows=None):
             super().__init__(full_bg, piece_rows, bg_rows)
-            self._tracker = _Tracker(gap, link, min_run,
-                                     self.buf_pieces * self.H - 2 * halo - self.H,
-                                     use_spatial_index=tracker_index)
+            tracker_type = _Tracker
+            if tracker_backend == 'cpp':
+                from cpp_tracker_backend import CppTracker
+                tracker_type = CppTracker
+            self._tracker = tracker_type(gap, link, min_run,
+                                         self.buf_pieces * self.H - 2 * halo - self.H,
+                                         use_spatial_index=tracker_index)
             self._stream_mode = False
             self._current_track = None
             self._stream_bg_src = None
@@ -204,6 +261,7 @@ def make_stream_detector(base, cfg):
             self.stream_prefilter_edge = 0
             self.stream_resets = 0
             self.stream_empty = 0
+            self._cut_cpp_errors = 0
             self.stream_mask_ns = 0
             self.stream_track_ns = 0
             self.stream_pieces = 0
@@ -214,8 +272,11 @@ def make_stream_detector(base, cfg):
             self.stream_onrun_max_ns = 0
             self._stream_busy_rows = 0
             self._stream_bg_warned = False
+            self._mask_capture = None
 
         def reset_stream(self):
+            if self._mask_capture is not None:
+                self._mask_capture.mark_reset()
             self.stream_resets += self._tracker.reset()
             self._current_track = None
             self._stream_busy_rows = 0
@@ -226,6 +287,8 @@ def make_stream_detector(base, cfg):
             super().note_gap()
 
         def _change_mode(self, mode):
+            if not mode and self._mask_capture is not None:
+                self._mask_capture.finish()
             self.reset_stream()
             # An object crossing a mode change is deliberately discarded.
             self.run_lo = self.run_hi = None
@@ -236,8 +299,17 @@ def make_stream_detector(base, cfg):
             self._stream_mode = mode
             self._stream_bg_src = None
             if mode:
+                if capture_blocks:
+                    from stream_mask_capture import MaskCapture
+                    self._mask_capture = MaskCapture(
+                        capture_dir, capture_blocks, x0=x0, x1=x1, gap=gap,
+                        link=link, min_run=min_run,
+                        max_rows=self.buf_pieces*self.H-2*halo-self.H,
+                        index=tracker_index)
+                    print(f'  STREAM запись масок: до {capture_blocks} порций '
+                          f'в {self._mask_capture.path}',flush=True)
                 print(f"  камера: STREAM tracking ON, GAP={gap}, "
-                      f"LINK_X={link}, MIN_RUN={min_run}", flush=True)
+                      f"LINK_X={link}, MIN_RUN={min_run}, TRACKER={tracker_backend}, CUT={cut_backend}", flush=True)
 
         def feed(self, piece, t_end=None, lag=0.0):
             mode = not self.frames_enabled
@@ -274,6 +346,12 @@ def make_stream_detector(base, cfg):
             self.stream_mask_ns += elapsed_mask_ns
             self.stream_mask_max_ns = max(self.stream_mask_max_ns, elapsed_mask_ns)
             self.stream_pieces += 1
+            if self._mask_capture is not None and not self._mask_capture.finished:
+                try:
+                    self._mask_capture.add(hit, base_row)
+                except Exception as exc:
+                    print(f'  STREAM запись масок остановлена: {exc!r}',flush=True)
+                    self._mask_capture.finished = True
             if not occupied and not self._tracker.active:
                 self._stream_busy_rows = 0
                 return []
@@ -281,6 +359,11 @@ def make_stream_detector(base, cfg):
             # Do not learn a new background from a dense product stream.
             # Warn once if almost the entire band stays foreground for a while.
             track_t0 = perf_counter_ns()
+            track_start_mono_ns = monotonic_ns() if stream_warn_ns else 0
+            track_cpu_start_ns = thread_time_ns() if stream_warn_ns else 0
+            active_before = len(self._tracker.active) if stream_warn_ns else 0
+            finished_before = self.stream_finished if stream_warn_ns else 0
+            indexed_before = self._tracker.indexed_rows if stream_warn_ns else 0
             for fraction in hit.mean(axis=1):
                 self._stream_busy_rows = (self._stream_busy_rows + 1
                                           if fraction > .75 else 0)
@@ -290,65 +373,131 @@ def make_stream_detector(base, cfg):
                 print('  камера: STREAM: длительно занята почти вся полоса; '
                       'проверьте фон на пустой ленте', flush=True)
 
+            if tracker_backend == 'cpp':
+                # Preserve the original callback row: a completed track is
+                # handed to cut before the next row of the same camera block.
+                for i in range(hit.shape[0]):
+                    row_start_ns = perf_counter_ns()
+                    completed = self._tracker.feed(hit[i:i+1], base_row+i, x0, _Track)
+                    self.stream_track_ns += perf_counter_ns() - row_start_ns
+                    self._emit_tracks(completed)
+                track_ns = perf_counter_ns() - track_t0
+                self.stream_track_max_ns = max(self.stream_track_max_ns, track_ns)
+                if stream_warn_ns and track_ns > stream_warn_ns:
+                    print(f'  STREAM TRACK ДОЛГО: row0={base_row} '
+                          f'track_ms={track_ns/1e6:.2f} '
+                          f'cpu_ms={(thread_time_ns()-track_cpu_start_ns)/1e6:.2f} '
+                          f'active={active_before}->{len(self._tracker.active)} '
+                          f'finished={self.stream_finished-finished_before}',flush=True)
+                return []
+
             # Find transitions for all rows at once. No Python loop over pixels.
             padded = np.pad(hit, ((0, 0), (1, 1)), constant_values=False)
             changes = padded[:, 1:] != padded[:, :-1]
             piece_track_ns = perf_counter_ns() - track_t0
+            setup_track_ns = piece_track_ns
             self.stream_track_ns += piece_track_ns
+            row_profiles = [] if stream_warn_ns else None
             for i, transitions in enumerate(changes):
                 t0 = perf_counter_ns()
+                row_cpu_t0 = thread_time_ns() if row_profiles is not None else 0
                 ends = np.flatnonzero(transitions) + x0
                 intervals = zip(ends[::2].tolist(), ends[1::2].tolist())
-                completed = self._tracker.step(base_row + i, intervals)
+                row_profile = None
+                if row_profiles is not None:
+                    row_profile = dict(row=base_row + i, raw_runs=len(ends)//2,
+                                       transition_ns=perf_counter_ns() - t0)
+                completed = self._tracker.step(base_row + i, intervals,
+                                               profile=row_profile)
                 row_track_ns = perf_counter_ns() - t0
+                if row_profile is not None:
+                    row_profile['row_ns'] = row_track_ns
+                    row_profile['row_cpu_ns'] = thread_time_ns() - row_cpu_t0
+                    row_profiles.append(row_profile)
                 self.stream_track_ns += row_track_ns
                 piece_track_ns += row_track_ns
-                for track in completed:
-                    self.stream_finished += 1
-                    if track.invalid or track.last - track.lo + 1 < min_rows:
-                        with self._stream_counts_lock:
-                            self.rejected += 1
-                            self.stream_invalid += 1
-                        self._diag_track(track, 'too_long' if track.invalid else 'short')
-                        continue
-                    if track_prefilter:
-                        # OPEN is anti-extensive. CLOSE with a symmetric flat
-                        # kernel stays within the raw mask bounding rectangle
-                        # (the mask has a zero halo). Consequently no output
-                        # component can exceed this *bounding box area*.
-                        # Do NOT use raw pixel count: CLOSE may fill holes.
-                        max_area = (track.x1 - track.x0) * (track.last - track.lo + 1)
-                        if max_area < min_area:
-                            self.stream_prefilter_area += 1
-                            with self._stream_counts_lock:
-                                self.stream_empty += 1
-                                self.rejected += 1
-                            self._diag_track(track, 'prefilter_area', max_area=max_area)
-                            continue
-                        # If the ENTIRE raw bounding box is within the
-                        # forbidden side strip, no post-morph component can
-                        # pass the unchanged edge test either.
-                        if track.x1 <= x0 + edge or track.x0 >= x1 - edge:
-                            self.stream_prefilter_edge += 1
-                            with self._stream_counts_lock:
-                                self.stream_empty += 1
-                                self.rejected += 1
-                            self._diag_track(track, 'prefilter_edge')
-                            continue
-                    if self.on_run is not None:
-                        self._current_track = track
-                        onrun_start_ns = perf_counter_ns()
-                        try:
-                            self.on_run(track.lo, track.last + 1)
-                        finally:
-                            onrun_ns = perf_counter_ns() - onrun_start_ns
-                            self.stream_onrun_n += 1
-                            self.stream_onrun_sum_ns += onrun_ns
-                            self.stream_onrun_max_ns = max(self.stream_onrun_max_ns,
-                                                           onrun_ns)
-                            self._current_track = None
+                self._emit_tracks(completed)
             self.stream_track_max_ns = max(self.stream_track_max_ns, piece_track_ns)
+            if stream_warn_ns and piece_track_ns >= stream_warn_ns and row_profiles:
+                track_end_mono_ns = monotonic_ns()
+                track_cpu_ns = thread_time_ns() - track_cpu_start_ns
+                worst = max(row_profiles, key=lambda r: r['row_ns'])
+                row_ms = ','.join(f"{r['row_ns']/1e6:.2f}" for r in row_profiles)
+                stage_ms = ' '.join(
+                    f'{name}={sum(r[name] for r in row_profiles)/1e6:.2f}'
+                    for name in ('transition_ns', 'group_ns', 'prepare_ns',
+                                 'candidate_ns', 'near_ns', 'associate_ns',
+                                 'update_ns', 'finish_ns'))
+                print(f"  STREAM TRACK ДОЛГО: row0={base_row} "
+                      f"track_ms={piece_track_ns/1e6:.2f} "
+                      f"setup_ms={setup_track_ns/1e6:.2f} "
+                      f"steps_ms={(piece_track_ns-setup_track_ns)/1e6:.2f} "
+                      f"cpu_ms={track_cpu_ns/1e6:.2f} "
+                      f"raw_runs={int(np.count_nonzero(changes))//2} "
+                      f"active={active_before}->{len(self._tracker.active)} "
+                      f"finished={self.stream_finished-finished_before} "
+                      f"indexed_rows={self._tracker.indexed_rows-indexed_before} "
+                      f"mono_start_ns={track_start_mono_ns} "
+                      f"mono_end_ns={track_end_mono_ns}")
+                print(f"  STREAM TRACK ЭТАПЫ: row_ms=[{row_ms}] "
+                      f"{stage_ms} "
+                      f"worst_row={worst['row']} "
+                      f"worst_row_cpu_ms={worst['row_cpu_ns']/1e6:.2f} "
+                      f"worst_runs={worst['raw_runs']} "
+                      f"worst_groups={worst['groups']} "
+                      f"worst_active={worst['active_before']}->{worst['active_after']} "
+                      f"worst_candidates={worst['candidates']} "
+                      f"worst_matches={worst['matches']} "
+                      f"worst_merged={worst['merged']} "
+                      f"worst_finished={worst['finished']} "
+                      f"worst_indexed={worst['indexed']}")
             return []
+
+        def _emit_tracks(self, completed):
+            for track in completed:
+                self.stream_finished += 1
+                if track.invalid or track.last - track.lo + 1 < min_rows:
+                    with self._stream_counts_lock:
+                        self.rejected += 1
+                        self.stream_invalid += 1
+                    self._diag_track(track, 'too_long' if track.invalid else 'short')
+                    continue
+                if track_prefilter:
+                    # OPEN is anti-extensive. CLOSE with a symmetric flat
+                    # kernel stays within the raw mask bounding rectangle
+                    # (the mask has a zero halo). Consequently no output
+                    # component can exceed this *bounding box area*.
+                    # Do NOT use raw pixel count: CLOSE may fill holes.
+                    max_area = (track.x1 - track.x0) * (track.last - track.lo + 1)
+                    if max_area < min_area:
+                        self.stream_prefilter_area += 1
+                        with self._stream_counts_lock:
+                            self.stream_empty += 1
+                            self.rejected += 1
+                        self._diag_track(track, 'prefilter_area', max_area=max_area)
+                        continue
+                    # If the ENTIRE raw bounding box is within the
+                    # forbidden side strip, no post-morph component can
+                    # pass the unchanged edge test either.
+                    if track.x1 <= x0 + edge or track.x0 >= x1 - edge:
+                        self.stream_prefilter_edge += 1
+                        with self._stream_counts_lock:
+                            self.stream_empty += 1
+                            self.rejected += 1
+                        self._diag_track(track, 'prefilter_edge')
+                        continue
+                if self.on_run is not None:
+                    self._current_track = track
+                    onrun_start_ns = perf_counter_ns()
+                    try:
+                        self.on_run(track.lo, track.last + 1)
+                    finally:
+                        onrun_ns = perf_counter_ns() - onrun_start_ns
+                        self.stream_onrun_n += 1
+                        self.stream_onrun_sum_ns += onrun_ns
+                        self.stream_onrun_max_ns = max(self.stream_onrun_max_ns,
+                                                       onrun_ns)
+                        self._current_track = None
 
         def _diag_track(self, track, reason, **extra):
             rec = getattr(self, '_diag_rec', None)
@@ -406,6 +555,42 @@ def make_stream_detector(base, cfg):
             track = snap['track']
             lo, hi = snap['lo'], snap['hi']
             left, right = max(x0, track.x0 - halo), min(x1, track.x1 + halo)
+            if cpp_cut is not None and snap['diag_rec'] is None:
+                try:
+                    items, at_edge, invalid, profile = cpp_cut.extract(
+                        snap, left=left, right=right, halo=halo, x0=x0, x1=x1,
+                        edge=edge, min_area=min_area, median_kernel=median_kernel,
+                        open_kernel=open_k, close_kernel=close_k)
+                except Exception as exc:
+                    with self._stream_counts_lock:
+                        self._cut_cpp_errors += 1
+                        errors = self._cut_cpp_errors
+                    if errors <= 3:
+                        print(f'  камера: C++ вырезание: {exc!r}; '
+                              'резервная Python-вырезка', flush=True)
+                else:
+                    metadata_start_ns = perf_counter_ns()
+                    found = []
+                    for a, b, r0, r1, area, crop in items:
+                        t_front, lag = snap['timings'][r0-lo]
+                        t_last, _ = snap['timings'][r1-1-lo]
+                        found.append(dict(x0=a,x1=b,row0=r0,row1=r1,
+                                          area=area,crop=crop,t_front=t_front,
+                                          t_last=t_last,cam_lag_ms=lag,
+                                          track_id=track.ident,
+                                          track_row0=track.lo,
+                                          track_row1=track.last+1,
+                                          camera_rows_per_sec=camera_rows_per_sec))
+                    with self._stream_counts_lock:
+                        self.stream_invalid += invalid
+                        self.stream_emitted += len(found)
+                        if not found:
+                            self.stream_empty += 1
+                            self.rejected += 1
+                    profile['bridge_metadata_ms'] = (
+                        perf_counter_ns()-metadata_start_ns)/1e6
+                    snap['cut_profile'] = profile
+                    return found, at_edge
             start = lo - halo
             stop = hi + halo
             profile_t0 = perf_counter_ns()
@@ -465,7 +650,10 @@ def make_stream_detector(base, cfg):
                 found.append(dict(x0=a,x1=b,row0=r0,row1=r1,
                                   area=area,crop=crop,t_front=t_front,
                                   t_last=t_last,cam_lag_ms=lag,
-                                  track_id=track.ident))
+                                  track_id=track.ident,
+                                  track_row0=track.lo,
+                                  track_row1=track.last + 1,
+                                  camera_rows_per_sec=camera_rows_per_sec))
             profile_t4 = perf_counter_ns()
             if diagnostic:
                 try:
@@ -496,7 +684,9 @@ def make_stream_detector(base, cfg):
 
         def stream_status(self):
             n = max(1, self.stream_pieces)
-            return (f'STREAM: active={len(self._tracker.active)}, '
+            return (f'STREAM: tracker_backend={tracker_backend} cut_backend={cut_backend} '
+                    f'cut_cpp_errors={self._cut_cpp_errors} '
+                    f'active={len(self._tracker.active)}, '
                     f'finished={self.stream_finished}, emitted={self.stream_emitted}, '
                     f'empty={self.stream_empty}, invalid={self.stream_invalid}, '
                     f'resets={self.stream_resets}, '

@@ -353,7 +353,8 @@ def handle(data: bytes):
         values = list(struct.unpack(f">{count}H", data[11:11 + count * 2]))
 
         if LOG_REGISTERS:
-            shown = values if count <= 8 else values[:8] + ["..."]
+            limit = 10 if start == 2 else 8
+            shown = values if count <= limit else values[:limit] + ["..."]
             print(f"запись: регистр {start}, количество {count}, значения {shown}")
 
         # Записанное попадает в карту регистров, чтобы его можно было прочитать.

@@ -81,6 +81,12 @@ GAIN = 200
 from valve_config import CONFIG as _LOG_CONFIG
 CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
 CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
+CUT_BACKEND = str(CUT_CONFIG.get("cut_backend", "python")).lower()
+TRACKER_BACKEND = str(CUT_CONFIG.get("tracker_backend", "python")).lower()
+MASK_CAPTURE_BLOCKS = int(CUT_CONFIG.get("mask_capture_blocks", 0))
+MASK_CAPTURE_DIR = str(CUT_CONFIG.get("mask_capture_dir", "mask_captures"))
+if MASK_CAPTURE_BLOCKS < 0 or MASK_CAPTURE_BLOCKS > 60000:
+    raise ValueError("processing.mask_capture_blocks: значение должно быть 0..60000")
 CUT_QUEUE_SIZE = max(1, int(CUT_CONFIG.get("cut_queue_size", 32)))
 CUT_WORKERS = int(CUT_CONFIG.get("cut_workers", 1))
 if CUT_WORKERS not in (1, 2, 3):
@@ -92,6 +98,7 @@ STREAM_TRACK_INDEX = bool(CUT_CONFIG.get("tracker_index", True))
 LOG_DETECTOR_DEBUG = bool((_LOG_CONFIG.get("logging") or {}).get("log_detector_debug", False))
 # Measurements are enabled during sorting; they do not alter segmentation.
 PIPELINE_TIMING = bool((_LOG_CONFIG.get("logging") or {}).get("pipeline_timing", True))
+STREAM_WARN_MS = max(0.0, float((_LOG_CONFIG.get("logging") or {}).get("stream_warn_ms", 5.0)))
 
 STREAM_TRACKING = True # Если истинно, применяется отдельный модуль детекции 
 # который находится в stream_detector.py
@@ -218,7 +225,7 @@ BG_ROWS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MIN_ROW_PIXELS = 25
 GAP_ROWS = 3
 MIN_ROWS = 6
-TH = 15
+TH = 30
 MIN_AREA = 200
 # Вырезка предметов для сортировки. Маска строится так же, как в
 # capture_simple.py, на котором набирались картинки для обучения: отличие
@@ -958,7 +965,9 @@ class LineCamera:
         self.cut_order_wait_sum_ms = 0.0
         self.cut_order_wait_max_ms = 0.0
         self.cut_profile_samples = {name: deque(maxlen=4096) for name in
-            ('ВырОч', 'Выр', 'ВырПор', 'МаскаВыр', 'Морф', 'Компон', 'Кроп')}
+            ('ВырОч', 'Выр', 'ВырПор', 'МаскаВыр', 'Морф', 'Компон', 'Кроп',
+             'ВходCPP', 'ВызовCPP', 'ЭкспCPP', 'ОбъектыCPP', 'МетаCPP',
+             'ОсвCPP')}
         self.snapshot_n = 0
         self.snapshot_sum_ns = 0
         self.snapshot_max_ns = 0
@@ -1365,12 +1374,25 @@ class LineCamera:
                     rec.error(e)
             feed_start_ns = time.perf_counter_ns() if PIPELINE_TIMING else 0
             feed_cpu_start_ns = time.thread_time_ns() if PIPELINE_TIMING else 0
+            feed_start_mono_ns = time.monotonic_ns() if PIPELINE_TIMING else 0
+            feed_row0 = det.total
             try:
                 results = det.feed(piece, t_end, lag)
             finally:
                 if PIPELINE_TIMING:
-                    self._measure_pipeline('feed', time.perf_counter_ns() - feed_start_ns)
-                    self._measure_pipeline('feed_cpu', time.thread_time_ns() - feed_cpu_start_ns)
+                    feed_end_ns = time.perf_counter_ns()
+                    feed_cpu_ns = time.thread_time_ns() - feed_cpu_start_ns
+                    self._measure_pipeline('feed', feed_end_ns - feed_start_ns)
+                    self._measure_pipeline('feed_cpu', feed_cpu_ns)
+                    if (STREAM_WARN_MS > 0 and not det.frames_enabled
+                            and feed_end_ns - feed_start_ns >= STREAM_WARN_MS * 1e6):
+                        feed_end_mono_ns = time.monotonic_ns()
+                        print(f"  STREAM FEED ДОЛГО: seq={seq} row0={feed_row0} "
+                              f"wall_ms={(feed_end_ns - feed_start_ns)/1e6:.2f} "
+                              f"cpu_ms={feed_cpu_ns/1e6:.2f} "
+                              f"cam_queue_ms={queue_wait_ns/1e6:.2f} pending={pending} "
+                              f"mono_start_ns={feed_start_mono_ns} "
+                              f"mono_end_ns={feed_end_mono_ns}")
             for frame in results:
                 self.objects += 1
                 with self._lock:
@@ -1443,6 +1465,14 @@ class LineCamera:
                            ('Компон', d.get('components_ms', 0)),
                            ('Кроп', d.get('crop_ms', 0))):
                 self.cut_profile_samples[key].append(v)
+            for key, label in (('bridge_prep_ms', 'ВходCPP'),
+                               ('bridge_call_ms', 'ВызовCPP'),
+                               ('bridge_export_ms', 'ЭкспCPP'),
+                               ('bridge_objects_ms', 'ОбъектыCPP'),
+                               ('bridge_metadata_ms', 'МетаCPP'),
+                               ('bridge_cleanup_ms', 'ОсвCPP')):
+                if key in d:
+                    self.cut_profile_samples[label].append(d[key])
             self.cut_order_wait_n += 1
             self.cut_order_wait_sum_ms += order_ms
             self.cut_order_wait_max_ms = max(self.cut_order_wait_max_ms, order_ms)
@@ -1979,7 +2009,8 @@ def sorting_metrics():
                   cut_profile_quantiles={key: ((float(np.percentile(values,95)),
                                                 float(np.percentile(values,99)))
                                                if values else (0.0, 0.0))
-                                         for key, values in cut_samples.items()},
+                                         for key, values in cut_samples.items()
+                                         if values or not key.endswith('CPP')},
                   snapshot_n=cam.snapshot_n,
                   snapshot_sum_ns=cam.snapshot_sum_ns,
                   snapshot_max_ns=cam.snapshot_max_ns,

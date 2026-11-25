@@ -1,0 +1,280 @@
+diff --git a/modbus_ethernet/cpp/README.md b/modbus_ethernet/cpp/README.md
+index 05e4dff..ce31483 100644
+--- a/modbus_ethernet/cpp/README.md
++++ b/modbus_ethernet/cpp/README.md
+@@ -99,3 +99,33 @@ python3 cpp/test_cut_parity.py
+ сравните P95/P99 `ИТОГ`, `Выр`, `Подг`, частоту опозданий, число объектов,
+ сводку STREAM, резервные вырезки и ошибки камеры на сопоставимых прогонах.
+ 
++## Запись настоящих STREAM-масок для проверки трекера
++
++Добавьте к существующей секции `processing`:
++
++```json
++"mask_capture_blocks": 30000,
++"mask_capture_dir": "mask_captures"
++```
++
++На следующем старте сортировки первые 30000 порций маски после порога
++запишутся подряд, включая пустые порции. Запись ограничена одной сессией;
++если сортировка закончится раньше, сохранятся уже собранные порции. Разрывы
++камеры помечаются сбросом состояния. По достижении лимита архив сохраняется
++в отдельном потоке в `modbus_ethernet/mask_captures/stream_masks_*.npz`.
++Это диагностический запуск: упаковка масок и сохранение архива добавляют
++нагрузку, поэтому его времена нельзя использовать как чистый бенчмарк.
++
++После сообщения `STREAM маски сохранены` запустите:
++
++```bash
++python3 cpp/replay_stream_masks.py mask_captures/stream_masks_YYYYMMDD_HHMMSS_ffffff.npz
++```
++
++Скрипт сравнивает все завершённые треки по порядку, строкам, координатам,
++площади, интервалам и признаку невалидности, а также число активных треков
++и объединений после каждой строки. При отличии выведет первую порцию и
++строку. После проверки верните `mask_capture_blocks` в 0, чтобы исключить
++влияние записи на сортировку. В архиве только бинарные маски и настройки
++трекера; цветные кадры и вырезки объектов не сохраняются.
++
+diff --git a/modbus_ethernet/cpp/replay_stream_masks.py b/modbus_ethernet/cpp/replay_stream_masks.py
+new file mode 100644
+index 0000000..f3ead42
+--- /dev/null
++++ b/modbus_ethernet/cpp/replay_stream_masks.py
+@@ -0,0 +1,85 @@
++"""Replay one real camera mask sequence through Python and C++ STREAM trackers."""
++import argparse
++import sys
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from stream_detector import _Track, _Tracker
++from cpp_tracker_backend import CppTracker
++
++
++def signature(track):
++    return (track.ident, track.lo, track.last, track.x0, track.x1,
++            track.area, track.invalid, track.runs)
++
++
++def replay(filename):
++    with np.load(filename, allow_pickle=False) as saved:
++        if int(saved['version']) != 1:
++            raise ValueError('неизвестная версия записи масок')
++        meta = {key: int(saved[key]) for key in
++                ('x0', 'x1', 'gap', 'link', 'min_run', 'max_rows', 'index')}
++        masks = saved['masks']
++        rows = saved['row0']
++        resets = saved['reset_before']
++        width = meta['x1'] - meta['x0']
++        if (masks.ndim != 3 or masks.dtype != np.uint8 or
++                masks.shape[0] != len(rows) or len(rows) != len(resets) or
++                masks.shape[2] != (width+7)//8 or width <= 0 or
++                len(rows) == 0 or len(rows) > 60000):
++            raise ValueError('неверная форма или размер сохранённых масок')
++        print(f'Файл: {filename}; порций={len(rows)}, строк/порция={masks.shape[1]}, '
++              f'ROI={meta["x0"]}:{meta["x1"]}, GAP={meta["gap"]}, '
++              f'LINK={meta["link"]}, MIN_RUN={meta["min_run"]}')
++        args = (meta['gap'], meta['link'], meta['min_run'], meta['max_rows'])
++        py = _Tracker(*args, use_spatial_index=bool(meta['index']))
++        cpp = CppTracker(*args, use_spatial_index=bool(meta['index']))
++        completed = invalid = resets_n = 0
++        try:
++            for block, (packed, row0, reset) in enumerate(zip(masks, rows, resets)):
++                if reset:
++                    a, b = py.reset(), cpp.reset()
++                    if a != b:
++                        raise AssertionError(f'порция {block}: сброс: Python={a}, C++={b}')
++                    resets_n += 1
++                hit = np.unpackbits(packed, axis=1, count=width)
++                # The live detector skips an entirely empty piece only when
++                # it has no active tracks; preserve that condition here.
++                if not hit.any() and not py.active and not cpp.active:
++                    continue
++                for i, row in enumerate(hit):
++                    padded = np.pad(row.astype(bool), (1,1), constant_values=False)
++                    ends = np.flatnonzero(padded[1:] != padded[:-1]) + meta['x0']
++                    intervals = zip(ends[::2].tolist(), ends[1::2].tolist())
++                    expected = py.step(int(row0)+i, intervals)
++                    actual = cpp.feed(row[None,:], int(row0)+i, meta['x0'], _Track)
++                    if len(expected) != len(actual):
++                        raise AssertionError(f'порция {block}, строка {i}: '
++                                             f'завершено Python={len(expected)}, C++={len(actual)}')
++                    for j, (a,b) in enumerate(zip(expected,actual)):
++                        if signature(a) != signature(b):
++                            raise AssertionError(f'порция {block}, строка {i}, трек {j}: '
++                                                 f'Python={signature(a)!r}; C++={signature(b)!r}')
++                        invalid += int(a.invalid)
++                    completed += len(expected)
++                    if len(py.active) != len(cpp.active) or py.merged != cpp.merged:
++                        raise AssertionError(f'порция {block}, строка {i}: '
++                                             'число активных треков или объединений не совпало')
++        finally:
++            cpp.close()
++        print(f'СОВПАДЕНИЕ: завершено={completed}, длинных невалидных={invalid}, '
++              f'объединений={py.merged}, сбросов={resets_n}, '
++              f'активных на конце={len(py.active)}')
++
++
++if __name__ == '__main__':
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('file',type=Path,help='stream_masks_*.npz из mask_captures')
++    args = parser.parse_args()
++    try:
++        replay(args.file)
++    except (AssertionError,ValueError,RuntimeError,OSError) as exc:
++        print(f'НЕСОВПАДЕНИЕ/ОШИБКА: {exc}',file=sys.stderr)
++        sys.exit(1)
+diff --git a/modbus_ethernet/line_camera.py b/modbus_ethernet/line_camera.py
+index 8cbf6b0..8f9da9f 100644
+--- a/modbus_ethernet/line_camera.py
++++ b/modbus_ethernet/line_camera.py
+@@ -83,6 +83,10 @@ CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
+ CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
+ CUT_BACKEND = str(CUT_CONFIG.get("cut_backend", "python")).lower()
+ TRACKER_BACKEND = str(CUT_CONFIG.get("tracker_backend", "python")).lower()
++MASK_CAPTURE_BLOCKS = int(CUT_CONFIG.get("mask_capture_blocks", 0))
++MASK_CAPTURE_DIR = str(CUT_CONFIG.get("mask_capture_dir", "mask_captures"))
++if MASK_CAPTURE_BLOCKS < 0 or MASK_CAPTURE_BLOCKS > 60000:
++    raise ValueError("processing.mask_capture_blocks: значение должно быть 0..60000")
+ CUT_QUEUE_SIZE = max(1, int(CUT_CONFIG.get("cut_queue_size", 32)))
+ CUT_WORKERS = int(CUT_CONFIG.get("cut_workers", 1))
+ if CUT_WORKERS not in (1, 2, 3):
+diff --git a/modbus_ethernet/stream_detector.py b/modbus_ethernet/stream_detector.py
+index 6e0a360..0e2cbfc 100644
+--- a/modbus_ethernet/stream_detector.py
++++ b/modbus_ethernet/stream_detector.py
+@@ -228,6 +228,8 @@ def make_stream_detector(base, cfg):
+     track_prefilter = bool(cfg.get('STREAM_TRACK_PREFILTER', False))
+     snapshot_band = bool(cfg.get('STREAM_SNAPSHOT_BAND', False))
+     tracker_index = bool(cfg.get('STREAM_TRACK_INDEX', False))
++    capture_blocks = int(cfg.get('MASK_CAPTURE_BLOCKS', 0))
++    capture_dir = cfg.get('MASK_CAPTURE_DIR', 'mask_captures')
+     tracker_backend = str(cfg.get('TRACKER_BACKEND', 'python')).lower()
+     if tracker_backend not in ('python', 'cpp'):
+         raise ValueError('processing.tracker_backend: задайте python или cpp')
+@@ -270,8 +272,11 @@ def make_stream_detector(base, cfg):
+             self.stream_onrun_max_ns = 0
+             self._stream_busy_rows = 0
+             self._stream_bg_warned = False
++            self._mask_capture = None
+ 
+         def reset_stream(self):
++            if self._mask_capture is not None:
++                self._mask_capture.mark_reset()
+             self.stream_resets += self._tracker.reset()
+             self._current_track = None
+             self._stream_busy_rows = 0
+@@ -282,6 +287,8 @@ def make_stream_detector(base, cfg):
+             super().note_gap()
+ 
+         def _change_mode(self, mode):
++            if not mode and self._mask_capture is not None:
++                self._mask_capture.finish()
+             self.reset_stream()
+             # An object crossing a mode change is deliberately discarded.
+             self.run_lo = self.run_hi = None
+@@ -292,6 +299,15 @@ def make_stream_detector(base, cfg):
+             self._stream_mode = mode
+             self._stream_bg_src = None
+             if mode:
++                if capture_blocks:
++                    from stream_mask_capture import MaskCapture
++                    self._mask_capture = MaskCapture(
++                        capture_dir, capture_blocks, x0=x0, x1=x1, gap=gap,
++                        link=link, min_run=min_run,
++                        max_rows=self.buf_pieces*self.H-2*halo-self.H,
++                        index=tracker_index)
++                    print(f'  STREAM запись масок: до {capture_blocks} порций '
++                          f'в {self._mask_capture.path}',flush=True)
+                 print(f"  камера: STREAM tracking ON, GAP={gap}, "
+                       f"LINK_X={link}, MIN_RUN={min_run}, TRACKER={tracker_backend}, CUT={cut_backend}", flush=True)
+ 
+@@ -330,6 +346,12 @@ def make_stream_detector(base, cfg):
+             self.stream_mask_ns += elapsed_mask_ns
+             self.stream_mask_max_ns = max(self.stream_mask_max_ns, elapsed_mask_ns)
+             self.stream_pieces += 1
++            if self._mask_capture is not None and not self._mask_capture.finished:
++                try:
++                    self._mask_capture.add(hit, base_row)
++                except Exception as exc:
++                    print(f'  STREAM запись масок остановлена: {exc!r}',flush=True)
++                    self._mask_capture.finished = True
+             if not occupied and not self._tracker.active:
+                 self._stream_busy_rows = 0
+                 return []
+diff --git a/modbus_ethernet/stream_mask_capture.py b/modbus_ethernet/stream_mask_capture.py
+new file mode 100644
+index 0000000..c5f6e1c
+--- /dev/null
++++ b/modbus_ethernet/stream_mask_capture.py
+@@ -0,0 +1,67 @@
++"""Bounded capture of consecutive STREAM masks for stateful tracker replay."""
++import os
++import threading
++from datetime import datetime
++from pathlib import Path
++
++import numpy as np
++
++
++class MaskCapture:
++    def __init__(self, directory, max_blocks, *, x0, x1, gap, link, min_run,
++                 max_rows, index):
++        directory = Path(directory)
++        self.directory = directory if directory.is_absolute() else Path(__file__).resolve().parent / directory
++        self.max_blocks = min(60000, max(1, int(max_blocks)))
++        self.meta = dict(version=1, x0=x0, x1=x1, gap=gap, link=link,
++                         min_run=min_run, max_rows=max_rows, index=int(index))
++        self.masks = []
++        self.row0 = []
++        self.resets = []
++        self.pending_reset = True
++        self.finished = False
++        self.path = self.directory / f"stream_masks_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.npz"
++
++    def mark_reset(self):
++        self.pending_reset = True
++
++    def add(self, hit, row0):
++        if self.finished:
++            return
++        if hit.ndim != 2 or hit.shape[1] != self.meta['x1']-self.meta['x0']:
++            raise ValueError('mask capture geometry changed')
++        # All camera portions, including empty masks, must be kept in order.
++        self.masks.append(np.packbits(hit, axis=1))
++        self.row0.append(row0)
++        self.resets.append(self.pending_reset)
++        self.pending_reset = False
++        if len(self.masks) >= self.max_blocks:
++            self.finish()
++
++    def finish(self):
++        if self.finished or not self.masks:
++            return
++        self.finished = True
++        mask_parts, row_parts, reset_parts = self.masks, self.row0, self.resets
++        meta = self.meta.copy()
++        self.masks, self.row0, self.resets = [], [], []
++
++        def write():
++            tmp = self.path.with_suffix('.npz.tmp')
++            try:
++                masks = np.stack(mask_parts)
++                rows = np.asarray(row_parts, dtype=np.int64)
++                resets = np.asarray(reset_parts, dtype=np.uint8)
++                self.directory.mkdir(parents=True, exist_ok=True)
++                with tmp.open('wb') as out:
++                    np.savez(out, masks=masks, row0=rows, reset_before=resets,
++                             **meta)
++                os.replace(tmp, self.path)
++                print(f'  STREAM маски сохранены: {self.path} '
++                      f'порций={len(rows)} строк={masks.shape[1]}',flush=True)
++            except Exception as exc:
++                print(f'  STREAM не удалось сохранить маски: {exc!r}',flush=True)
++                try: tmp.unlink(missing_ok=True)
++                except OSError: pass
++
++        threading.Thread(target=write, name='stream-mask-writer',daemon=True).start()

@@ -84,6 +84,10 @@ SORT_DEFAULTS = {
     "min_confidence": 0.0,
     # Ядро NPU: 0, 1, 2, или -1 - пусть выбирает сам.
     "npu_core": 0,
+    # "python" = RKNNLite, "cpp" = постоянный контекст через libjelly_rknn.so.
+    "npu_backend": "python",
+    # Подготовка BGR вырезки к размеру модели и преобразование в RGB.
+    "npu_prepare_backend": "python",
     # Столько полных классификаций выполнить на каждом ядре до сортировки.
     "npu_warmup_calls": 200,
     # Необязательно: путь к настоящей вырезке для прогрева (от каталога сервера).
@@ -150,6 +154,7 @@ LOG_SUMMARY = bool(LOG_CFG.get("log_summary", True))
 SUMMARY_SEC = max(0.1, float(LOG_CFG.get("summary_sec", CFG["summary_sec"])))
 LOG_POSITIONS = bool(LOG_CFG.get("log_positions", False))
 NPU_WARN_MS = float(LOG_CFG.get("npu_warn_ms", 5.0))
+ASSEMBLY_WARN_MS = max(0.0, float(LOG_CFG.get("assembly_warn_ms", 6.0)))
 NPU_DETAIL_EACH = bool(LOG_CFG.get("npu_detail_each", False))
 PIPELINE_TIMING = bool(LOG_CFG.get("pipeline_timing", True))
 PIPELINE_TIMING_EACH = bool(LOG_CFG.get("pipeline_timing_each", True))
@@ -192,12 +197,6 @@ class Classifier:
         except ImportError:
             raise RuntimeError("нет модуля PyYAML для чтения models.yaml: "
                                "python3 -m pip install pyyaml")
-        try:
-            from rknnlite.api import RKNNLite
-        except ImportError:
-            raise RuntimeError("нет rknn-toolkit-lite2 (модуль rknnlite) "
-                               "в этом Python")
-
         path = CFG["model_config"]
         if not os.path.isabs(path):
             path = os.path.normpath(os.path.join(HERE, path))
@@ -223,15 +222,36 @@ class Classifier:
         if not os.path.exists(model):
             raise RuntimeError(f"нет модели {model}")
 
-        cores = {0: RKNNLite.NPU_CORE_0, 1: RKNNLite.NPU_CORE_1,
-                 2: RKNNLite.NPU_CORE_2, -1: RKNNLite.NPU_CORE_AUTO}
-        self.rknn = RKNNLite()
-        if self.rknn.load_rknn(model) != 0:
-            raise RuntimeError(f"load_rknn не открыл {model}")
-        if self.rknn.init_runtime(
-                core_mask=cores.get(int(CFG["npu_core"]) if core is None else core,
-                                    RKNNLite.NPU_CORE_0)) != 0:
-            raise RuntimeError("init_runtime не запустил NPU")
+        self.backend = str(CFG["npu_backend"]).lower()
+        core_id = int(CFG["npu_core"]) if core is None else int(core)
+        if self.backend == "python":
+            try:
+                from rknnlite.api import RKNNLite
+            except ImportError:
+                raise RuntimeError("нет rknn-toolkit-lite2 (модуль rknnlite) "
+                                   "в этом Python")
+            cores = {0: RKNNLite.NPU_CORE_0, 1: RKNNLite.NPU_CORE_1,
+                     2: RKNNLite.NPU_CORE_2, -1: RKNNLite.NPU_CORE_AUTO}
+            self.rknn = RKNNLite()
+            if self.rknn.load_rknn(model) != 0:
+                raise RuntimeError(f"load_rknn не открыл {model}")
+            if self.rknn.init_runtime(core_mask=cores[core_id]) != 0:
+                raise RuntimeError("init_runtime не запустил NPU")
+        elif self.backend == "cpp":
+            from cpp_rknn_backend import CppRKNN
+            self.rknn = CppRKNN(model, core_id)
+            if self.rknn.input_bytes != self.height * self.width * 3:
+                raise RuntimeError("размер входа C++ RKNN не совпадает с models.yaml")
+            if self.rknn.output_count != len(self.classes):
+                raise RuntimeError("размер выхода C++ RKNN не совпадает с classes")
+        else:
+            raise ValueError("sorting.npu_backend: используйте 'python' или 'cpp'")
+        self.prepare_backend = str((CFG.get('npu_prepare_backend') or 'python')).lower()
+        if self.prepare_backend == 'cpp':
+            from cpp_prepare_backend import CppPrepare
+            self.cpp_prepare = CppPrepare()
+        elif self.prepare_backend != 'python':
+            raise ValueError("sorting.npu_prepare_backend: задайте python или cpp")
         self.model = model
 
         # Первый вывод после загрузки в разы медленнее остальных: NPU
@@ -280,7 +300,8 @@ class Classifier:
         total_ms = (time.perf_counter_ns() - start) / 1e6
         print(f"NPU WARMUP core={core} calls={calls} total_ms={total_ms:.1f} "
               f"slow_over_3ms={slow} max_rknn_ms={max_rknn_ms:.2f} "
-              f"max_call={max_call}")
+              f"max_call={max_call} source={crop_path or 'synthetic'} "
+              f"crop={crop.shape[1]}x{crop.shape[0]}")
 
     def classify_timed(self, crop_bgr):
         """(class, confidence, timings): preparation / RKNN / result, ms.
@@ -291,9 +312,12 @@ class Classifier:
         which device or lock caused a long call.
         """
         start = time.perf_counter_ns()
-        padded = resize_pad(crop_bgr, self.width, self.height)
-        rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
-        inp = np.expand_dims(rgb, 0)
+        if self.prepare_backend == 'cpp':
+            inp = self.cpp_prepare(crop_bgr, self.width, self.height)
+        else:
+            padded = resize_pad(crop_bgr, self.width, self.height)
+            rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+            inp = np.expand_dims(rgb, 0)
         before_rknn = time.perf_counter_ns()
         cpu_before = time.thread_time_ns()
         out = self.rknn.inference(inputs=[inp])
@@ -927,6 +951,14 @@ def _cut_detail(obj, due, front):
                        ("Компон", "components_ms"), ("Кроп", "crop_ms")):
         value = profile.get(key)
         fields.append(f"{label}={value:.2f}" if value is not None else f"{label}=—")
+    for label, key in (("ВходCPP", "bridge_prep_ms"),
+                       ("ВызовCPP", "bridge_call_ms"),
+                       ("ЭкспCPP", "bridge_export_ms"),
+                       ("ОбъектыCPP", "bridge_objects_ms"),
+                       ("МетаCPP", "bridge_metadata_ms"),
+                       ("ОсвCPP", "bridge_cleanup_ms")):
+        if key in profile:
+            fields.append(f"{label}={profile[key]:.2f}")
     for label, key in (("ОстВход", "cut_started_at"), ("ОстВыход", "cut_finished_at")):
         stamp = obj.get(key)
         if front is None or stamp is None:
@@ -946,6 +978,7 @@ def _decide(obj, received, session, model, core):
             _count("unknown")
             return
     crop = obj["crop"]
+    nn_start_mono_ns = time.monotonic_ns()
     t_nn = time.monotonic()
     if hasattr(model, 'classify_timed'):
         name, conf, npu_detail = model.classify_timed(crop)
@@ -953,9 +986,12 @@ def _decide(obj, received, session, model, core):
         name, conf = model(crop)
         npu_detail = {}
     t_nn_end = time.monotonic()
+    nn_end_mono_ns = time.monotonic_ns()
     nn_ms = (t_nn_end - t_nn) * 1000
     if nn_ms >= NPU_WARN_MS:
-        print(f'  NPU ДОЛГО: {nn_ms:.2f} мс | '
+        print(f'  NPU ДОЛГО: {nn_ms:.2f} мс | core={core} '
+              f'track={obj.get("track_id")} row0={obj.get("row0")} '
+              f'mono_start_ns={nn_start_mono_ns} mono_end_ns={nn_end_mono_ns} | '
               f'подготовка={npu_detail.get("Подг", 0):.2f} '
               f'RKNN={npu_detail.get("RKNN", nn_ms):.2f} '
               f'результат={npu_detail.get("Рез", 0):.2f} '
@@ -1052,6 +1088,33 @@ def _decide(obj, received, session, model, core):
                     status=status, valves=list(hit), event_id=event_id, due=due, decision=now))
             except Exception as e:
                 rec.error(e)
+        if ASSEMBLY_WARN_MS and parts.get('Сбор', 0) > ASSEMBLY_WARN_MS:
+            row0, row1 = obj['row0'], obj['row1']
+            rows = row1 - row0
+            rate = obj.get('camera_rows_per_sec') or 0
+            expected_ms = (max(0, rows - 1) * 1000 / rate
+                           if rate > 0 else None)
+            expected = (f'{expected_ms:.2f}' if expected_ms is not None else '—')
+            drift = (f'{parts["Сбор"] - expected_ms:+.2f}'
+                     if expected_ms is not None else '—')
+            close_ms = ((t_found - actual_front) * 1000
+                        if t_found is not None and actual_front is not None else None)
+            after_last_ms = ((t_found - t_last) * 1000
+                             if t_found is not None and t_last is not None else None)
+            track_lo = obj.get('track_row0')
+            track_hi = obj.get('track_row1')
+            track_span = (f'{track_lo}:{track_hi} ({track_hi - track_lo} строк)'
+                          if track_lo is not None and track_hi is not None else '—')
+            close = f'{close_ms:.2f}' if close_ms is not None else '—'
+            after_last = (f'{after_last_ms:.2f}'
+                          if after_last_ms is not None else '—')
+            print(f'  СБОР ДОЛГО: #{number:04d} track={obj.get("track_id")} '
+                  f'объект={row0}:{row1} ({rows} строк) трек={track_span} '
+                  f'скорость={rate:.0f} строк/с '
+                  f'Сбор={parts["Сбор"]:.2f} мс расчёт={expected} мс '
+                  f'разница={drift} мс '
+                  f'до_закрытия={close} мс '
+                  f'после_последней={after_last} мс')
         if LOG_OBJECTS:
             fmt = lambda k: f"{parts[k]:.2f}" if k in parts else "—"
             stages = " ".join(f"{k}={fmt(k)}" for k in
@@ -1084,7 +1147,7 @@ def _worker(core):
             if core == NPU_CORES[0]:
                 _classifier = model
             _ready_cores.add(core)
-        print(f"NPU READY core={core} model={model.model} input={model.width}x{model.height} "
+        print(f"NPU READY backend={model.backend} core={core} model={model.model} input={model.width}x{model.height} "
               f"infer_ms={model.infer_ms:.2f}")
     except Exception as e:
         with _lock:
