@@ -82,6 +82,7 @@ from valve_config import CONFIG as _LOG_CONFIG
 CUT_CONFIG = dict(_LOG_CONFIG.get("processing") or {})
 CUT_ASYNC = bool(CUT_CONFIG.get("async_cut", False))
 CUT_BACKEND = str(CUT_CONFIG.get("cut_backend", "python")).lower()
+DETECTION_BACKEND = str(CUT_CONFIG.get("detection_backend", "python")).lower()
 TRACKER_BACKEND = str(CUT_CONFIG.get("tracker_backend", "python")).lower()
 MASK_CAPTURE_BLOCKS = int(CUT_CONFIG.get("mask_capture_blocks", 0))
 MASK_CAPTURE_DIR = str(CUT_CONFIG.get("mask_capture_dir", "mask_captures"))
@@ -1091,6 +1092,14 @@ class LineCamera:
 
     def open(self):
         ksj = self._load()
+        backend = (_LOG_CONFIG.get("camera") or {}).get("capture_backend", "python")
+        self.native_capture = None
+        if backend == "cpp":
+            from cpp_capture_backend import NativeCapture
+            self.native_capture = NativeCapture(ksj)
+        elif backend != "python":
+            raise CameraError(f"неизвестный camera.capture_backend: {backend!r}")
+        print(f"  камера: захват backend={backend}")
         ksj.KSJ_Init()
 
         if ksj.KSJ_DeviceGetCount() < 1:
@@ -1113,6 +1122,11 @@ class LineCamera:
             ksj.KSJ_UnInit()
             raise CameraError(f"камера вернула размер {self.width}x{self.height}")
 
+        if self.native_capture and bits.value != 24:
+            if hasattr(ksj, "KSJ_Close"):
+                ksj.KSJ_Close(IDX)
+            ksj.KSJ_UnInit()
+            raise CameraError(f"C++ захват ожидает BGR24, SDK вернул {bits.value} бит")
         self.ksj = ksj
         self.piece_sec = piece_sec
         self.group = max(1, -(-PROC_ROWS // self.height))
@@ -1162,7 +1176,9 @@ class LineCamera:
 
     def _grabber(self):
         """Только забирает порции и кладёт в очередь, без обработки."""
-        buf = create_string_buffer(self.width * self.height * self.channels)
+        native = self.native_capture
+        shape = (self.height, self.width, self.channels)
+        buf = None if native else create_string_buffer(self.width * self.height * self.channels)
         seq = 0
         skip = SKIP_PIECES
         last_end = None
@@ -1182,7 +1198,10 @@ class LineCamera:
                 self.gap_sum += g
                 self.gap_n += 1
                 self.gap_max = max(self.gap_max, g)
-            rc = self.ksj.KSJ_CaptureRgbData(IDX, buf)
+            if native:
+                rc, piece = native.acquire(IDX, shape)
+            else:
+                rc = self.ksj.KSJ_CaptureRgbData(IDX, buf)
             last_end = time.perf_counter()
             t_end = time.monotonic()        # для сортировки, см. row_time
             if not skip:
@@ -1253,14 +1272,17 @@ class LineCamera:
                 self.lag_late += 1
 
             self.grabbed += 1
-            piece = np.frombuffer(buf, np.uint8).reshape(
-                self.height, self.width, self.channels)
-            # Камера отдаёт строки порции в обратном порядке: сверху самая
-            # свежая. Без переворота время внутри порции идёт снизу вверх,
-            # а от порции к порции - сверху вниз, и предмет на стыке
-            # распадается на две половинки в 256 строках друг от друга.
-            # Перевернув порцию, получаем сплошной поток сверху вниз.
-            piece = (piece[::-1] if FLIP_PIECES else piece).copy()
+            if native:
+                piece = native.chronological(piece, FLIP_PIECES)
+            else:
+                piece = np.frombuffer(buf, np.uint8).reshape(
+                    self.height, self.width, self.channels)
+                # Камера отдаёт строки порции в обратном порядке: сверху самая
+                # свежая. Без переворота время внутри порции идёт снизу вверх,
+                # а от порции к порции - сверху вниз, и предмет на стыке
+                # распадается на две половинки в 256 строках друг от друга.
+                # Перевернув порцию, получаем сплошной поток сверху вниз.
+                piece = (piece[::-1] if FLIP_PIECES else piece).copy()
 
             # Яркость ленты - чтобы после сбоя было видно, что изменилось.
             level = piece[::16, X0:X1:16].reshape(-1, 3).mean(axis=0)

@@ -55,20 +55,22 @@ class CppTracker:
         return n
 
     def feed(self, hit, row0, x0, track_type):
-        hit = np.ascontiguousarray(hit, dtype=np.uint8)
+        hit = np.ascontiguousarray(hit.view(np.uint8) if hit.dtype == np.bool_ else hit, dtype=np.uint8)
         if hit.ndim != 2: raise ValueError('tracker expects a two-dimensional mask')
         stats, err = _Stats(), C.create_string_buffer(256)
         rc = self.lib.jelly_tracker_feed(self.handle, hit.ctypes.data, *hit.shape,
                                          row0, x0, C.byref(stats), err, len(err))
         if rc: raise RuntimeError(err.value.decode(errors='replace'))
+        self.active_count = stats.active
+        for key in ('merged','indexed_rows','linear_rows','index_candidates','linear_candidates'):
+            setattr(self, key, getattr(stats,key))
+        if not stats.count:
+            return []
         infos = (_TrackInfo * max(1, stats.count))()
         runs = np.empty(max(1,stats.run_count*3), dtype=np.int64)
         rc = self.lib.jelly_tracker_export(self.handle, infos, stats.count,
                                            runs.ctypes.data, stats.run_count*3, err, len(err))
         if rc: raise RuntimeError(err.value.decode(errors='replace'))
-        self.active_count = stats.active
-        for key in ('merged','indexed_rows','linear_rows','index_candidates','linear_candidates'):
-            setattr(self, key, getattr(stats,key))
         result=[]
         for info in list(infos)[:stats.count]:
             if info.run_offset > stats.run_count or info.run_count > stats.run_count-info.run_offset:

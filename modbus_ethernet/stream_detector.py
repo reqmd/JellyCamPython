@@ -230,6 +230,9 @@ def make_stream_detector(base, cfg):
     tracker_index = bool(cfg.get('STREAM_TRACK_INDEX', False))
     capture_blocks = int(cfg.get('MASK_CAPTURE_BLOCKS', 0))
     capture_dir = cfg.get('MASK_CAPTURE_DIR', 'mask_captures')
+    detection_backend = cfg.get('DETECTION_BACKEND', 'python')
+    if detection_backend not in ('python', 'cpp'):
+        raise ValueError('processing.detection_backend: задайте python или cpp')
     tracker_backend = str(cfg.get('TRACKER_BACKEND', 'python')).lower()
     if tracker_backend not in ('python', 'cpp'):
         raise ValueError('processing.tracker_backend: задайте python или cpp')
@@ -242,6 +245,10 @@ def make_stream_detector(base, cfg):
     class StreamingObjectDetector(base):
         def __init__(self, full_bg, piece_rows, bg_rows=None):
             super().__init__(full_bg, piece_rows, bg_rows)
+            self.native_detection = None
+            if detection_backend == 'cpp':
+                from cpp_detection_backend import NativeDetection
+                self.native_detection = NativeDetection()
             tracker_type = _Tracker
             if tracker_backend == 'cpp':
                 from cpp_tracker_backend import CppTracker
@@ -309,7 +316,7 @@ def make_stream_detector(base, cfg):
                     print(f'  STREAM запись масок: до {capture_blocks} порций '
                           f'в {self._mask_capture.path}',flush=True)
                 print(f"  камера: STREAM tracking ON, GAP={gap}, "
-                      f"LINK_X={link}, MIN_RUN={min_run}, TRACKER={tracker_backend}, CUT={cut_backend}", flush=True)
+                      f"LINK_X={link}, MIN_RUN={min_run}, DETECTION={detection_backend}, TRACKER={tracker_backend}, CUT={cut_backend}", flush=True)
 
         def feed(self, piece, t_end=None, lag=0.0):
             mode = not self.frames_enabled
@@ -323,10 +330,16 @@ def make_stream_detector(base, cfg):
             if self._stream_bg_src is not self.full_bg:
                 self._stream_bg_src = self.full_bg
                 self._stream_bg = self.full_bg[x0:x1].astype(np.int16)
-            d = piece[:, x0:x1].astype(np.int16) - self._stream_bg
-            d -= row_median(d[:, ::8])
-            np.abs(d, out=d)
-            hit = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2]) > threshold
+            if self.native_detection:
+                hit, touched, dense, occupied = self.native_detection.mask(
+                    piece, self._stream_bg, x0, threshold, col_step, touch_pixels)
+            else:
+                d = piece[:, x0:x1].astype(np.int16) - self._stream_bg
+                d -= row_median(d[:, ::8])
+                np.abs(d, out=d)
+                hit = np.maximum(np.maximum(d[..., 0], d[..., 1]), d[..., 2]) > threshold
+                touched = hit[:, ::col_step].sum(axis=1) * col_step >= touch_pixels
+                occupied = bool(hit.any())
             rec = getattr(self, '_diag_rec', None)
             entry = getattr(self, '_diag_entry', None)
             if rec is not None and entry is not None:
@@ -334,12 +347,10 @@ def make_stream_detector(base, cfg):
                     rec.mask(entry, hit)
                 except Exception as e:
                     rec.error(e)
-            counts = hit[:, ::col_step].sum(axis=1) * col_step
             # Maintain the original history (including timestamps) so capture
             # mode and the existing time-to-valve contract remain unchanged.
             base_row = self.total
-            self._store_piece(piece, counts >= touch_pixels, t_end, lag)
-            occupied = bool(hit.any())
+            self._store_piece(piece, touched, t_end, lag)
             if not occupied:
                 self.idle += 1
             elapsed_mask_ns = perf_counter_ns() - t0
@@ -364,9 +375,11 @@ def make_stream_detector(base, cfg):
             active_before = len(self._tracker.active) if stream_warn_ns else 0
             finished_before = self.stream_finished if stream_warn_ns else 0
             indexed_before = self._tracker.indexed_rows if stream_warn_ns else 0
-            for fraction in hit.mean(axis=1):
+            if not self.native_detection:
+                dense = hit.mean(axis=1) > .75
+            for is_dense in dense:
                 self._stream_busy_rows = (self._stream_busy_rows + 1
-                                          if fraction > .75 else 0)
+                                          if is_dense else 0)
             if (self._stream_busy_rows > self.buf_pieces * self.H
                     and not self._stream_bg_warned):
                 self._stream_bg_warned = True

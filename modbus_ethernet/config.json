@@ -51,7 +51,8 @@
     "dark_subtract": false,
     "ccm": null,
     "gain": 200,
-    "black_level": null
+    "black_level": null,
+    "capture_backend": "cpp"
   },
   "logging": {
     "log_registers": false,
@@ -73,7 +74,7 @@
     "post_ms": 220,
     "max_ms": 500,
     "manual_ms": 1500,
-    "max_fragments": 24,
+    "max_fragments": 64,
     "max_memory_mb": 384,
     "trigger_threshold": 25,
     "trigger_pixels": 5,
@@ -89,6 +90,7 @@
     "cut_backend": "cpp",
     "tracker_backend": "cpp",
     "mask_capture_blocks": 0,
-    "mask_capture_dir": "mask_captures"
+    "mask_capture_dir": "mask_captures",
+    "detection_backend": "cpp"
   }
 }
